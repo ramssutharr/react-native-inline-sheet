@@ -35,14 +35,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ramssutharr/react-native-bottom-sheet-native.git"
+    "url": "git+https://github.com/ramssutharr/react-native-inline-native.git"
   },
   "author": "Ram Suthar",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/ramssutharr/react-native-bottom-sheet-native/issues"
+    "url": "https://github.com/ramssutharr/react-native-inline-native/issues"
   },
-  "homepage": "https://github.com/ramssutharr/react-native-bottom-sheet-native#readme",
+  "homepage": "https://github.com/ramssutharr/react-native-inline-native#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
