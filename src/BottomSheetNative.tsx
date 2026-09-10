@@ -8,6 +8,7 @@ import React, {
   useState,
 } from 'react';
 import {
+  BackHandler,
   Platform,
   StyleSheet,
   useWindowDimensions,
@@ -312,6 +313,21 @@ function BottomSheetNativeInner<T = any>(
     if (!presentedRef.current || node == null) return;
     Commands.dismiss(node);
   }, []);
+
+  // Android hardware/gesture back: React Native routes the legacy back press
+  // through its own JS BackHandler and only falls through to the Activity's
+  // OnBackPressedDispatcher (where the native sheet registers) if no JS
+  // listener claims it — so claim it here while presented. The native
+  // callback still serves the predictive-back path.
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !presented) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (!presentedRef.current) return false;
+      dismiss();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [presented, dismiss]);
 
   const snapToIndex = useCallback((index: number) => {
     const node = nativeRef.current;
