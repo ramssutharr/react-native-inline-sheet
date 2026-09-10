@@ -1,4 +1,4 @@
-# react-native-bottom-sheet-native
+# react-native-inline-sheet
 
 Instagram-style bottom sheet for React Native (Fabric / New Architecture).
 The **frame** — present/dismiss, drag, detents, dim, scroll hand-off, keyboard —
@@ -13,7 +13,7 @@ as it was.
 ## Usage
 
 ```tsx
-import { BottomSheetNative, type BottomSheetNativeRef } from 'react-native-bottom-sheet-native';
+import { BottomSheetNative, type BottomSheetNativeRef } from 'react-native-inline-sheet';
 
 const ref = useRef<BottomSheetNativeRef<{ postId: number }>>(null);
 

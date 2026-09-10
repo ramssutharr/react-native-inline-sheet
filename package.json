@@ -1,5 +1,5 @@
 {
-  "name": "react-native-bottom-sheet-native",
+  "name": "react-native-inline-sheet",
   "version": "0.1.0",
   "description": "Instagram-style native bottom sheet for React Native (Fabric): the frame — present/dismiss, drag, detents, dim, scroll hand-off, keyboard — is UIKit / Android View code; the content is ordinary React. Inline mode lives in the screen's own layer, so a stack push slides over the open sheet and popping reveals it untouched.",
   "main": "./src/index.ts",
