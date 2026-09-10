@@ -35,14 +35,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ramssutharr/react-native-inline-native.git"
+    "url": "git+https://github.com/ramssutharr/react-native-inline-sheet.git"
   },
   "author": "Ram Suthar",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/ramssutharr/react-native-inline-native/issues"
+    "url": "https://github.com/ramssutharr/react-native-inline-sheet/issues"
   },
-  "homepage": "https://github.com/ramssutharr/react-native-inline-native#readme",
+  "homepage": "https://github.com/ramssutharr/react-native-inline-sheet#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
