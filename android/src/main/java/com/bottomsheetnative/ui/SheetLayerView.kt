@@ -522,12 +522,21 @@ class SheetLayerView(
         applyVisible()
     }
 
+    /** Whole-sheet rise in 'lift-sheet' keyboard mode (never past the top inset). */
+    private fun sheetKeyboardLift(): Float {
+        if (keyboardMode != "lift-sheet" || keyboardLift <= 0f) return 0f
+        val room = height - maxDetentInset - bottomInset - visible
+        return max(0f, min(keyboardLift, room))
+    }
+
+    private fun footerKeyboardLift(): Float = if (keyboardMode == "lift-footer") keyboardLift else 0f
+
     /** Everything that depends on [visible]: translation, dim, slots. */
     private fun applyVisible() {
         val h = height
         if (h == 0) return
         // `bottomInset` lifts the resting bottom edge (above a tab bar, say).
-        container.translationY = h - bottomInset - visible
+        container.translationY = h - bottomInset - visible - sheetKeyboardLift()
         val first = resolvedHeight(0)
         val progress = if (first > 0f) (visible / first).coerceIn(0f, 1f) else 1f
         dim.alpha = if (dimmed) dimOpacity * progress else 0f
@@ -550,7 +559,7 @@ class SheetLayerView(
         // in/out) it stays anchored at the lowest detent and travels with the
         // sheet — the Instagram footer.
         val anchor = max(visible, bottomHeight())
-        val footerTop = max(0f, anchor - keyboardLift - footerHeight).roundToInt()
+        val footerTop = max(0f, anchor - footerKeyboardLift() - footerHeight).roundToInt()
         footerSlot.measure(
             MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
             MeasureSpec.makeMeasureSpec(footerH, MeasureSpec.EXACTLY),
@@ -727,11 +736,12 @@ class SheetLayerView(
 
     /** The IME inset is measured from the window's bottom edge — used as-is. */
     private fun applyIme(bottomPx: Int) {
-        if (keyboardMode != "lift-footer") return
+        if (keyboardMode == "none") return
         val lift = max(0f, bottomPx - bottomInset)
         if (lift == keyboardLift) return
         keyboardLift = lift
-        layoutSlots()
+        // 'lift-sheet' moves the container, 'lift-footer' only the footer slot.
+        applyVisible()
         // The keyboard opening takes the sheet to its top detent (IG
         // comments); the spring runs alongside the IME's own animation.
         if (lift > 0 && presented && expandOnKeyboard && currentIndex != topIndex()) {

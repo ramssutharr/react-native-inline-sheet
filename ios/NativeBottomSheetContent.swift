@@ -19,7 +19,8 @@ import UIKit
 ///               background never shows a gap under a spring overshoot
 ///   bodySlot  : (0, grabberArea, W, footerTop - grabberArea), clips
 ///   footerSlot: (0, footerTop, W, footerH) with
-///               footerTop = visible - keyboardLift - footerH
+///               footerTop = visible - keyboardLift - footerH   ('lift-footer')
+///   'lift-sheet': the whole container rises by the keyboard instead
 ///   dim       : layer bounds, alpha = dimOpacity * min(1, visible / detent0)
 ///
 /// Everything RN-specific (finding the body's RN scroll view, cancelling
@@ -442,6 +443,19 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     layer.grabber.layer.cornerRadius = grabberSize.height / 2
   }
 
+  /// How far the whole sheet is raised by the keyboard in 'lift-sheet' mode
+  /// (never past the top inset).
+  private func sheetKeyboardLift() -> CGFloat {
+    guard keyboardMode == "lift-sheet", keyboardLift > 0, let layer = sheetLayer else { return 0 }
+    let room = layer.bounds.height - maxDetentInset - bottomInset - visibleHeight
+    return max(0, min(keyboardLift, room))
+  }
+
+  /// The footer's own lift (only in 'lift-footer' mode).
+  private func footerKeyboardLift() -> CGFloat {
+    keyboardMode == "lift-footer" ? keyboardLift : 0
+  }
+
   fileprivate func layoutSheet() {
     guard let layer = sheetLayer else { return }
     let w = layer.bounds.width
@@ -454,7 +468,9 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
 
     // `bottomInset` lifts the resting bottom edge (above a tab bar, say);
     // everything else is measured from that edge.
-    layer.container.frame = CGRect(x: 0, y: h - bottomInset - visibleHeight, width: w, height: h + Self.overshoot)
+    layer.container.frame = CGRect(
+      x: 0, y: h - bottomInset - visibleHeight - sheetKeyboardLift(),
+      width: w, height: h + Self.overshoot)
     layer.grabber.isHidden = !grabberVisible
     layer.grabber.frame = CGRect(
       x: (w - grabberSize.width) / 2, y: 8,
@@ -464,7 +480,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     // stays anchored at the lowest detent and travels with the sheet — the
     // Instagram footer.
     let anchor = max(visibleHeight, bottomHeight)
-    let footerTop = max(0, anchor - keyboardLift - footerHeight)
+    let footerTop = max(0, anchor - footerKeyboardLift() - footerHeight)
     layer.footerSlot.frame = CGRect(x: 0, y: footerTop, width: w, height: footerHeight)
     layer.bodySlot.frame = CGRect(x: 0, y: grabberArea, width: w, height: max(0, footerTop - grabberArea))
   }
@@ -521,7 +537,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private func freezeAtPresentation() {
     guard let layer = sheetLayer else { return }
     if let presentation = layer.container.layer.presentation() {
-      visibleHeight = max(0, layer.bounds.height - bottomInset - presentation.frame.minY)
+      visibleHeight = max(0, layer.bounds.height - bottomInset - sheetKeyboardLift() - presentation.frame.minY)
     }
     animationGeneration += 1
     [layer.container, layer.dimView, layer.grabber, layer.bodySlot, layer.footerSlot]
@@ -730,7 +746,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private func isAtTopOnScreen() -> Bool {
     guard let layer = sheetLayer else { return false }
     let minY = layer.container.layer.presentation()?.frame.minY ?? layer.container.frame.minY
-    return layer.bounds.height - bottomInset - minY >= topHeight - 0.5
+    return layer.bounds.height - bottomInset - sheetKeyboardLift() - minY >= topHeight - 0.5
   }
 
   private func enforceContentLock(_ scrollView: UIScrollView) {
@@ -820,7 +836,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   // MARK: - Keyboard
 
   @objc private func keyboardWillChange(_ notification: Notification) {
-    guard isPresented, keyboardMode == "lift-footer",
+    guard isPresented, keyboardMode != "none",
           let layer = sheetLayer, let window = layer.window,
           let info = notification.userInfo,
           let endValue = info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue

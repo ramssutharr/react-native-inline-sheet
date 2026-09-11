@@ -104,7 +104,7 @@ export type BottomSheetNativeProps<T = any> = {
   keyboardBehavior?: KeyboardBehavior;
   /** Detent animation starting: (fromIndex, toIndex); -1 = closed. */
   onAnimate?: (fromIndex: number, toIndex: number) => void;
-  keyboardMode?: 'lift-footer' | 'none';
+  keyboardMode?: 'lift-footer' | 'lift-sheet' | 'none';
   /** Spring to the top detent when the keyboard opens (default true). */
   expandOnKeyboard?: boolean;
   /** Dismiss the keyboard as soon as the sheet takes a drag (default true). */
@@ -157,7 +157,6 @@ function BottomSheetNativeInner<T = any>(
     grabberWidth: grabberWidthProp,
     grabberHeight: grabberHeightProp,
     dismissOnBackdropPress = true,
-    keyboardMode = 'lift-footer',
     dismissKeyboardOnDrag = true,
     hostStrategy = 'outermost-screen',
     footer,
@@ -204,8 +203,12 @@ function BottomSheetNativeInner<T = any>(
     grabberHeightProp ?? (typeof flatHandle.height === 'number' ? flatHandle.height : 5);
   const dimOpacity = props.dimOpacity ?? backdropOpacity ?? 0.5;
   const dimmed = props.dimmed ?? dimOpacity > 0;
+  // gorhom: 'interactive' moves the whole sheet with the keyboard (the body
+  // holds the inputs); 'extend' / 'fillParent' expand to the top detent.
   const expandOnKeyboard =
     keyboardBehavior != null ? keyboardBehavior !== 'interactive' : (props.expandOnKeyboard ?? true);
+  const keyboardMode =
+    keyboardBehavior === 'interactive' ? 'lift-sheet' : (props.keyboardMode ?? 'lift-footer');
 
   const nativeRef = useRef<React.ElementRef<typeof NativeBottomSheetView>>(null);
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();

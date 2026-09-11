@@ -94,7 +94,12 @@ export interface NativeProps extends ViewProps {
   /** Dragging below the lowest detent dismisses (else it rubber-bands). */
   enablePanToDismiss?: CodegenTypes.WithDefault<boolean, true>;
   dismissOnBackdropPress?: CodegenTypes.WithDefault<boolean, true>;
-  /** 'lift-footer' (default) | 'none'. */
+  /**
+   * 'lift-footer' (default): the footer slot rises over the keyboard, the
+   * body is clipped behind it. 'lift-sheet': the WHOLE sheet rises by the
+   * keyboard height (gorhom's `keyboardBehavior="interactive"` — for
+   * content-sized sheets with inputs in the body). 'none'.
+   */
   keyboardMode?: CodegenTypes.WithDefault<string, 'lift-footer'>;
   /** Spring to the top detent when the keyboard opens (Instagram's comments). */
   expandOnKeyboard?: CodegenTypes.WithDefault<boolean, true>;
