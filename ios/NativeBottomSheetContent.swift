@@ -1036,13 +1036,20 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
 
   private func resolveScrollView() -> UIScrollView? {
     guard let body = bodyChild else { return nil }
-    if let resolved = scrollViewResolver?(body) { return resolved }
-    // Plain-UIKit fallback: breadth-first, first vertical scroll view.
+    // The host's resolver knows which scroll views are React lists; its
+    // answer is final. Falling through to a UIKit-wide search would latch
+    // onto scroll views that are NOT content — a UIDatePicker's internal
+    // table, a multiline text input's UITextView — and pin their offsets,
+    // which they fight back on every frame until the stack overflows.
+    if let resolver = scrollViewResolver { return resolver(body) }
+    // Plain-UIKit fallback (no host resolver): breadth-first, first vertical
+    // scroll view, skipping pickers and text views.
     var queue: [UIView] = [body]
     var visited = 0
     while !queue.isEmpty && visited < 4000 {
       let view = queue.removeFirst()
       visited += 1
+      if view is UIPickerView || view is UIDatePicker || view is UITextView { continue }
       if let scrollView = view as? UIScrollView,
          scrollView.contentSize.height >= scrollView.contentSize.width || scrollView.alwaysBounceVertical {
         return scrollView
