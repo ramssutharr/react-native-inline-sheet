@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.provider.Settings
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
@@ -40,23 +41,26 @@ import kotlin.math.roundToInt
  *
  * Attached on present to the hosting screen's own view — the OUTERMOST
  * `com.swmansion.rnscreens.Screen` on the way up from the Fabric host — so it
- * covers a tab bar but sits under anything the stack pushes. Fabric never
- * lays this view out (it does not propagate descendants' requestLayout), so
- * it sizes itself to the host and re-runs its own layout pass when asked.
+ * covers a tab bar but sits under anything the stack pushes; or, in modal
+ * mode, to the `ReactRootView` above every screen. Fabric never lays this
+ * view out (it does not propagate descendants' requestLayout), so it sizes
+ * itself to the host and re-runs its own layout pass when asked.
  *
  * Geometry (px), driven by [visible]:
  *
- *   container : laid out once at (0, 0, W, H + overshoot); moved with
+ *   container : laid out once at (m, 0, W - m, H + overshoot); moved with
  *               `translationY = H - visible` so no layout pass runs per frame
- *   bodySlot  : (0, grabberArea, W, footerTop) inside the container, clips
+ *               (detached: its outline is clipped to `visible`, all corners)
+ *   handleSlot: (0, 0, W, handleArea)
+ *   bodySlot  : (0, handleArea, W, footerTop) inside the container, clips
  *   footerSlot: (0, footerTop, W, footerTop + footerH) with
  *               footerTop = visible - keyboardLift - footerH
  *   dim       : layer bounds, alpha = dimOpacity * min(1, visible / detent0)
  *
- * The RN body/footer children are re-parented into the slots and NEVER
- * measured or laid out here — Fabric drives their frames (an UNSPECIFIED
- * measure from us would abort with "A catalyst view must have an explicit
- * width and height"); the slots only clip and move.
+ * The RN body/footer/handle children are re-parented into the slots and
+ * NEVER measured or laid out here — Fabric drives their frames (an
+ * UNSPECIFIED measure from us would abort with "A catalyst view must have an
+ * explicit width and height"); the slots only clip and move.
  *
  * Hand-rolled on purpose (no Material BottomSheetBehavior): identical px /
  * N-detent physics to iOS, explicit choice of the scrolling child, and a
@@ -80,22 +84,32 @@ class SheetLayerView(
     private var initialDetent = 0
     private var maxDetentInset = 0f
     private var bottomInset = 0f
+    private var maxAutoHeight = 0f
+    private var contentBottomInset = 0f
     private var dimmed = true
     private var dimOpacity = 0.5f
     private var dimColor = Color.BLACK
-    private var cornerRadius = dp(24f)
+    private var cornerRadius = dp(15f)
     private var grabberVisible = true
-    private var grabberAreaHeight = dp(22f)
+    private var grabberAreaHeight = dp(24f)
     private var sheetBackgroundColor = Color.WHITE
-    private var grabberColor = 0x80808080.toInt()
-    private var grabberWidth = dp(36f).roundToInt()
-    private var grabberHeight = dp(5f).roundToInt()
+    private var grabberColor = 0xBF000000.toInt()
+    private var grabberWidth = dp(30f).roundToInt()
+    private var grabberHeight = dp(4f).roundToInt()
     private var panToDismiss = true
     private var dismissOnBackdrop = true
-    private var keyboardMode = "lift-footer"
-    private var expandOnKeyboard = true
-    private var dismissKeyboardOnDrag = true
+    private var contentPanning = true
+    private var handlePanning = true
+    private var overDrag = true
+    private var overDragResistance = 2.5f
+    private var keyboardMode = "lift-sheet"
+    private var expandOnKeyboard = false
+    private var restoreOnKeyboardHide = false
+    private var dismissKeyboardOnDrag = false
+    private var detached = false
+    private var detachedMargin = 0f
     private var hostStrategy = "outermost-screen"
+    private var positionEvents = false
 
     // MARK: - Views
 
@@ -103,12 +117,17 @@ class SheetLayerView(
         setBackgroundColor(Color.BLACK)
         alpha = 0f
         isClickable = true
+        contentDescription = "Bottom sheet backdrop"
         setOnClickListener { onBackdropTap() }
     }
     private val container = SheetContainer(context)
     private val background = GradientDrawable()
-    private val grabber = View(context)
+    private val grabber = View(context).apply {
+        contentDescription = "Bottom sheet handle"
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+    }
     private val grabberDrawable = GradientDrawable()
+    private val handleSlot = SlotView(context)
     private val bodySlot = SlotView(context)
     private val footerSlot = SlotView(context)
 
@@ -116,29 +135,39 @@ class SheetLayerView(
 
     private var bodyChild: View? = null
     private var footerChild: View? = null
+    private var handleChild: View? = null
     private var bodyAutoHeight = 0f
     private var footerHeight = 0f
+    private var handleHeight = 0f
     private val bodyLayoutListener = View.OnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
         bodyHeightChanged((bottom - top).toFloat())
     }
     private val footerLayoutListener = View.OnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
         footerHeightChanged((bottom - top).toFloat())
     }
+    private val handleLayoutListener = View.OnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+        handleHeightChanged((bottom - top).toFloat())
+    }
 
     // MARK: - State
 
     private var presented = false
     private var currentIndex = 0
+    /** A `snapToHeight` target that is not a detent (gorhom's temporary position). */
+    private var temporaryTarget: Float? = null
     private var visible = 0f
     private var keyboardLift = 0f
+    /** Where the sheet sat before the keyboard expanded it (for the restore). */
+    private var indexBeforeKeyboard: Int? = null
     private var hostView: ViewGroup? = null
     private var springAnim: SpringAnimation? = null
     private var backCallback: OnBackPressedCallback? = null
     private var dragEmittedStart = false
+    private var lastPosition = Float.NaN
 
     private data class Emitted(
         val index: Int, val sheet: Float, val body: Float, val maxBody: Float,
-        val footer: Float, val keyboard: Float, val phase: Int,
+        val footer: Float, val keyboard: Float, val host: Float, val dynamic: Int, val phase: Int,
     )
     private var lastEmitted: Emitted? = null
 
@@ -160,6 +189,7 @@ class SheetLayerView(
         addView(dim)
         addView(container)
         container.addView(grabber)
+        container.addView(handleSlot)
         container.addView(bodySlot)
         container.addView(footerSlot)
         grabber.background = grabberDrawable
@@ -215,6 +245,8 @@ class SheetLayerView(
     fun setInitialDetent(index: Int) { initialDetent = index }
     fun setMaxDetentInsetDp(value: Float) { maxDetentInset = dp(value) }
     fun setBottomInsetDp(value: Float) { bottomInset = dp(value) }
+    fun setContentBottomInsetDp(value: Float) { contentBottomInset = max(0f, dp(value)) }
+    fun setMaxAutoHeightDp(value: Float) { maxAutoHeight = if (value > 0f) dp(value) else 0f }
     fun setDimColor(color: Int?) { dimColor = color ?: Color.BLACK }
     fun setGrabberWidthDp(value: Float) { grabberWidth = dp(value).roundToInt() }
     fun setGrabberHeightDp(value: Float) { grabberHeight = dp(value).roundToInt() }
@@ -224,13 +256,25 @@ class SheetLayerView(
     fun setGrabber(value: Boolean) { grabberVisible = value }
     fun setGrabberAreaHeightDp(value: Float) { grabberAreaHeight = dp(value) }
     fun setSheetBackgroundColor(color: Int?) { sheetBackgroundColor = color ?: Color.WHITE }
-    fun setGrabberColor(color: Int?) { grabberColor = color ?: 0x80808080.toInt() }
+    fun setGrabberColor(color: Int?) { grabberColor = color ?: 0xBF000000.toInt() }
     fun setEnablePanToDismiss(value: Boolean) { panToDismiss = value }
     fun setDismissOnBackdropPress(value: Boolean) { dismissOnBackdrop = value }
+    fun setEnableContentPanningGesture(value: Boolean) { contentPanning = value }
+    fun setEnableHandlePanningGesture(value: Boolean) { handlePanning = value }
+    fun setEnableOverDrag(value: Boolean) { overDrag = value }
+    fun setOverDragResistanceFactor(value: Float) { overDragResistance = max(1f, value) }
     fun setKeyboardMode(value: String) { keyboardMode = value }
     fun setExpandOnKeyboard(value: Boolean) { expandOnKeyboard = value }
+    fun setRestoreDetentOnKeyboardHide(value: Boolean) { restoreOnKeyboardHide = value }
     fun setDismissKeyboardOnDrag(value: Boolean) { dismissKeyboardOnDrag = value }
+    fun setDetached(value: Boolean) { detached = value }
+    fun setDetachedMarginDp(value: Float) { detachedMargin = max(0f, dp(value)) }
     fun setHostStrategy(value: String) { hostStrategy = value }
+    fun setPositionEventsEnabled(value: Boolean) {
+        positionEvents = value
+        lastPosition = Float.NaN
+        if (value && presented) emitPosition()
+    }
 
     /** After every prop of a commit: re-resolve, since detents read the inset and grabber area. */
     fun onPropsApplied() {
@@ -243,15 +287,19 @@ class SheetLayerView(
 
     private fun applyChrome() {
         background.setColor(sheetBackgroundColor)
-        background.cornerRadii = floatArrayOf(
-            cornerRadius, cornerRadius, cornerRadius, cornerRadius, 0f, 0f, 0f, 0f,
-        )
+        val r = cornerRadius
+        background.cornerRadii = if (detached) {
+            floatArrayOf(r, r, r, r, r, r, r, r)
+        } else {
+            floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
         grabberDrawable.setColor(grabberColor)
         grabberDrawable.cornerRadius = grabberHeight / 2f
         dim.setBackgroundColor(dimColor)
         container.invalidateOutline()
-        grabber.visibility = if (grabberVisible) VISIBLE else GONE
+        grabber.visibility = if (grabberVisible && handleChild == null) VISIBLE else GONE
         dim.visibility = if (dimmed) VISIBLE else GONE
+        if (hostView != null) requestLayout()
     }
 
     // MARK: - React children
@@ -270,6 +318,13 @@ class SheetLayerView(
                 moveTo(child, if (isAttachedToHost()) footerSlot else null)
                 footerHeightChanged(child.height.toFloat())
             }
+            "sheet-handle" -> {
+                handleChild = child
+                child.addOnLayoutChangeListener(handleLayoutListener)
+                moveTo(child, if (isAttachedToHost()) handleSlot else null)
+                grabber.visibility = GONE
+                handleHeightChanged(child.height.toFloat())
+            }
             else -> moveTo(child, null)
         }
     }
@@ -285,6 +340,14 @@ class SheetLayerView(
             footerChild = null
             footerHeight = 0f
             layoutSlots()
+        }
+        if (handleChild === child) {
+            child.removeOnLayoutChangeListener(handleLayoutListener)
+            handleChild = null
+            handleHeight = 0f
+            grabber.visibility = if (grabberVisible) VISIBLE else GONE
+            layoutSlots()
+            if (presented) emitLayout(1)
         }
         (child.parent as? ViewGroup)?.removeView(child)
     }
@@ -303,6 +366,7 @@ class SheetLayerView(
     private fun attachChildrenToSlots() {
         bodyChild?.let { moveTo(it, bodySlot) }
         footerChild?.let { moveTo(it, footerSlot) }
+        handleChild?.let { moveTo(it, handleSlot) }
     }
 
     private fun bodyHeightChanged(height: Float) {
@@ -320,9 +384,17 @@ class SheetLayerView(
         if (isAuto(currentIndex)) settleToCurrent(0f) else emitLayout(1)
     }
 
+    private fun handleHeightChanged(height: Float) {
+        if (abs(height - handleHeight) < 0.5f) return
+        handleHeight = height
+        layoutSlots()
+        if (!presented) return
+        if (isAuto(currentIndex)) settleToCurrent(0f) else emitLayout(1)
+    }
+
     // MARK: - Commands
 
-    fun present(index: Int) {
+    fun present(index: Int, animated: Boolean) {
         val host = resolveHost() ?: return
         if (parent !== host) {
             (parent as? ViewGroup)?.removeView(this)
@@ -343,27 +415,57 @@ class SheetLayerView(
         val wasPresented = presented
         presented = true
         currentIndex = clampIndex(index)
+        temporaryTarget = null
+        indexBeforeKeyboard = null
         if (!wasPresented) {
             visible = 0f
             keyboardLift = 0f
             lastEmitted = null
+            lastPosition = Float.NaN
             layoutSheet()
             installBack()
             refreshInsets()
             owner.onPresent?.invoke()
         }
-        settleToCurrent(0f)
+        if (animated) {
+            settleToCurrent(0f)
+        } else {
+            cancelSpring()
+            emitLayout(0)
+            setVisibleRaw(targetHeight())
+            emitLayout(1)
+        }
     }
 
     fun snapTo(index: Int) {
         if (!presented) return
         currentIndex = clampIndex(index)
+        temporaryTarget = null
+        indexBeforeKeyboard = null
+        settleToCurrent(0f)
+    }
+
+    /** gorhom's `snapToPosition`: any height, expressed like one detent token (dp or fraction). */
+    fun snapToHeight(spec: String) {
+        if (!presented) return
+        val v = spec.trim().toFloatOrNull() ?: return
+        if (v <= 0f) return
+        val available = availableHeight()
+        val target = if (v <= 1f) v * available else min(dp(v), available)
+        val heights = resolvedHeights()
+        var nearest = 0
+        heights.forEachIndexed { i, h -> if (h <= target + 0.5f) nearest = i }
+        currentIndex = nearest
+        temporaryTarget = target
+        indexBeforeKeyboard = null
         settleToCurrent(0f)
     }
 
     fun dismiss(reason: String) {
         if (!presented) return
         presented = false
+        temporaryTarget = null
+        indexBeforeKeyboard = null
         container.abortDrag()
         uninstallBack()
         if (dragEmittedStart) {
@@ -393,14 +495,20 @@ class SheetLayerView(
         detachFromHost()
         bodyChild?.let { it.removeOnLayoutChangeListener(bodyLayoutListener); (it.parent as? ViewGroup)?.removeView(it) }
         footerChild?.let { it.removeOnLayoutChangeListener(footerLayoutListener); (it.parent as? ViewGroup)?.removeView(it) }
+        handleChild?.let { it.removeOnLayoutChangeListener(handleLayoutListener); (it.parent as? ViewGroup)?.removeView(it) }
         bodyChild = null
         footerChild = null
+        handleChild = null
         bodyAutoHeight = 0f
         footerHeight = 0f
+        handleHeight = 0f
         visible = 0f
         keyboardLift = 0f
         currentIndex = 0
+        temporaryTarget = null
+        indexBeforeKeyboard = null
         lastEmitted = null
+        lastPosition = Float.NaN
     }
 
     private fun detachFromHost() {
@@ -417,15 +525,25 @@ class SheetLayerView(
         var probe = owner.parent
         var nearest: ViewGroup? = null
         var outermost: ViewGroup? = null
+        var root: ViewGroup? = null
         while (probe != null) {
-            if (probe::class.java.name == "com.swmansion.rnscreens.Screen") {
-                if (nearest == null) nearest = probe as? ViewGroup
-                outermost = probe as? ViewGroup
+            when (probe::class.java.name) {
+                "com.swmansion.rnscreens.Screen" -> {
+                    if (nearest == null) nearest = probe as? ViewGroup
+                    outermost = probe as? ViewGroup
+                }
+                // React Native's root: above every screen, and its touch
+                // dispatcher still reaches anything parented here.
+                "com.facebook.react.ReactRootView" -> root = probe as? ViewGroup
             }
             probe = probe.parent
         }
-        val chosen = if (hostStrategy == "nearest-screen") nearest else outermost
-        return chosen ?: activity()?.findViewById(android.R.id.content)
+        val content = activity()?.findViewById<ViewGroup>(android.R.id.content)
+        return when (hostStrategy) {
+            "nearest-screen" -> nearest ?: outermost ?: root ?: content
+            "root" -> root ?: content
+            else -> outermost ?: root ?: content
+        }
     }
 
     /**
@@ -440,39 +558,53 @@ class SheetLayerView(
                 .firstOrNull()
 
     // MARK: - Detents
+    // Detents are given in the author's order but every index in the contract
+    // refers to the order of their RESOLVED heights (gorhom sorts its snap
+    // points the same way once a dynamic content height joins them).
 
-    private val grabberArea: Float get() = if (grabberVisible) grabberAreaHeight else 0f
+    private val handleArea: Float
+        get() = if (handleChild != null) handleHeight else if (grabberVisible) grabberAreaHeight else 0f
 
     private fun clampIndex(index: Int): Int = index.coerceIn(0, detents.size - 1)
 
-    private fun isAuto(index: Int): Boolean = detents[clampIndex(index)] is Detent.Auto
-
     private fun availableHeight(): Float = max(0f, height - maxDetentInset - bottomInset)
 
-    private fun resolvedHeight(index: Int): Float {
+    /** Height of the detent at its AUTHORED position. */
+    private fun rawHeight(rawIndex: Int): Float {
         val available = availableHeight()
-        return when (val d = detents[clampIndex(index)]) {
-            is Detent.Auto -> min(available, bodyAutoHeight + grabberArea + footerHeight)
+        return when (val d = detents[rawIndex]) {
+            is Detent.Auto -> {
+                val cap = if (maxAutoHeight > 0f) min(available, maxAutoHeight) else available
+                min(cap, bodyAutoHeight + handleArea + footerHeight)
+            }
             is Detent.Fraction -> d.value * available
             is Detent.Points -> min(d.px, available)
         }
     }
 
-    private fun resolvedHeights(): List<Float> = detents.indices.map { resolvedHeight(it) }
+    /** Authored indices sorted by resolved height (stable). */
+    private fun sortedOrder(): List<Int> {
+        val raw = detents.indices.map { rawHeight(it) }
+        return detents.indices.sortedWith(compareBy({ raw[it] }, { it }))
+    }
+
+    private fun isAuto(index: Int): Boolean = detents[sortedOrder()[clampIndex(index)]] is Detent.Auto
+
+    private fun resolvedHeight(index: Int): Float = rawHeight(sortedOrder()[clampIndex(index)])
+
+    /** Ascending. */
+    private fun resolvedHeights(): List<Float> = detents.indices.map { rawHeight(it) }.sorted()
 
     /** Body height at the tallest non-auto detent; -1 when every detent is auto. */
     private fun maxBodyHeight(): Float {
-        val top = detents.indices.filter { !isAuto(it) }.map { resolvedHeight(it) }.maxOrNull() ?: return -1f
-        return max(0f, top - grabberArea - footerHeight)
+        val top = detents.indices.filter { detents[it] !is Detent.Auto }.map { rawHeight(it) }.maxOrNull() ?: return -1f
+        return max(0f, top - handleArea - footerHeight)
     }
-    private fun topHeight(): Float = resolvedHeights().maxOrNull() ?: 0f
-    private fun topIndex(): Int {
-        val heights = resolvedHeights()
-        val top = heights.maxOrNull() ?: return 0
-        return heights.indexOf(top).coerceAtLeast(0)
-    }
-    private fun bottomHeight(): Float = resolvedHeights().minOrNull() ?: 0f
-    private fun atDetent(): Boolean = resolvedHeights().any { abs(it - visible) < 1f }
+    private fun topHeight(): Float = resolvedHeights().lastOrNull() ?: 0f
+    private fun topIndex(): Int = (detents.size - 1).coerceAtLeast(0)
+    private fun bottomHeight(): Float = resolvedHeights().firstOrNull() ?: 0f
+    /** Where the sheet is heading: a temporary height or the current detent. */
+    private fun targetHeight(): Float = temporaryTarget ?: resolvedHeight(currentIndex)
 
     // MARK: - Layout (self-driven; Fabric never lays this view out)
 
@@ -495,6 +627,8 @@ class SheetLayerView(
         layout(0, 0, w, h)
     }
 
+    private fun containerMargin(): Int = if (detached) detachedMargin.roundToInt() else 0
+
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val w = MeasureSpec.getSize(widthMeasureSpec)
         val h = MeasureSpec.getSize(heightMeasureSpec)
@@ -504,7 +638,7 @@ class SheetLayerView(
             MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY),
         )
         container.measure(
-            MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(max(0, w - 2 * containerMargin()), MeasureSpec.EXACTLY),
             MeasureSpec.makeMeasureSpec(h + overshoot, MeasureSpec.EXACTLY),
         )
     }
@@ -518,7 +652,8 @@ class SheetLayerView(
         val h = height
         if (w == 0 || h == 0) return
         dim.layout(0, 0, w, h)
-        container.layout(0, 0, w, h + overshoot)
+        val m = containerMargin()
+        container.layout(m, 0, w - m, h + overshoot)
         applyVisible()
     }
 
@@ -529,7 +664,16 @@ class SheetLayerView(
         return max(0f, min(keyboardLift, room))
     }
 
-    private fun footerKeyboardLift(): Float = if (keyboardMode == "lift-footer") keyboardLift else 0f
+    /**
+     * The footer's own lift: all of the keyboard in 'lift-footer' mode; in
+     * 'lift-sheet' mode whatever the sheet itself could not rise, so a footer
+     * always clears the keyboard (what gorhom's footer does in every mode).
+     */
+    private fun footerKeyboardLift(): Float = when (keyboardMode) {
+        "lift-footer" -> keyboardLift
+        "lift-sheet" -> max(0f, keyboardLift - sheetKeyboardLift())
+        else -> 0f
+    }
 
     /** Everything that depends on [visible]: translation, dim, slots. */
     private fun applyVisible() {
@@ -540,7 +684,9 @@ class SheetLayerView(
         val first = resolvedHeight(0)
         val progress = if (first > 0f) (visible / first).coerceIn(0f, 1f) else 1f
         dim.alpha = if (dimmed) dimOpacity * progress else 0f
+        if (detached) container.invalidateOutline()
         layoutSlots()
+        emitPosition()
     }
 
     private fun layoutSlots() {
@@ -552,6 +698,13 @@ class SheetLayerView(
             MeasureSpec.makeMeasureSpec(grabberHeight, MeasureSpec.EXACTLY),
         )
         grabber.layout(gx, grabberTop, gx + grabberWidth, grabberTop + grabberHeight)
+
+        val handleH = if (handleChild != null) handleHeight.roundToInt() else 0
+        handleSlot.measure(
+            MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(handleH, MeasureSpec.EXACTLY),
+        )
+        handleSlot.layout(0, 0, w, handleH)
 
         val footerH = footerHeight.roundToInt()
         // Pinned to the screen's bottom edge while the sheet sits at or above
@@ -566,7 +719,7 @@ class SheetLayerView(
         )
         footerSlot.layout(0, footerTop, w, footerTop + footerH)
 
-        val bodyTop = grabberArea.roundToInt()
+        val bodyTop = handleArea.roundToInt()
         val bodyBottom = max(bodyTop, footerTop)
         bodySlot.measure(
             MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
@@ -587,15 +740,27 @@ class SheetLayerView(
         override fun setValue(o: SheetLayerView, value: Float) = o.setVisibleRaw(value)
     }
 
+    /** The system's "remove animations" setting: jump instead of springing. */
+    private fun animationsDisabled(): Boolean = try {
+        Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+    } catch (_: Exception) {
+        false
+    }
+
     private fun settleToCurrent(velocity: Float) {
         emitLayout(0)
-        settle(resolvedHeight(currentIndex), velocity) {
+        settle(targetHeight(), velocity) {
             if (presented) emitLayout(1)
         }
     }
 
     private fun settle(target: Float, velocity: Float, onEnd: (() -> Unit)? = null) {
         cancelSpring()
+        if (animationsDisabled()) {
+            setVisibleRaw(target)
+            onEnd?.invoke()
+            return
+        }
         val anim = SpringAnimation(this, visibleProperty).apply {
             spring = SpringForce(target).setStiffness(650f).setDampingRatio(0.86f)
             setStartVelocity(velocity)
@@ -619,17 +784,35 @@ class SheetLayerView(
 
     // MARK: - Drag (shared by the container's touch path and nested scrolling)
 
-    private fun applyDrag(height: Float) {
+    /** gorhom's over-drag curve: the excess collapses to `sqrt(1 + excess) × factor`. */
+    private fun resist(excess: Float): Float = kotlin.math.sqrt(1f + max(0f, excess)) * overDragResistance
+
+    /**
+     * [allowTopOverDrag]: gorhom over-drags past the top only from the handle
+     * or when the body has no scrollable at all — a list takes the gesture.
+     */
+    private fun applyDrag(height: Float, allowTopOverDrag: Boolean = false) {
         var target = height
         val top = topHeight()
         val bottom = bottomHeight()
         if (target > top) {
-            // Hard stop at the top detent (IG / gorhom), no rubber band.
-            target = top
+            target = if (overDrag && allowTopOverDrag) top + resist(target - top) else top
         } else if (target < bottom && !panToDismiss) {
-            target = bottom - (bottom - target) * 0.2f
+            target = bottom - resist(bottom - target)
         }
         setVisibleRaw(target)
+    }
+
+    /** Whether the body contains any nested-scrolling list (cached per drag). */
+    private fun bodyHasScrollable(): Boolean {
+        fun scan(view: View): Boolean {
+            if (ViewCompat.isNestedScrollingEnabled(view) &&
+                (view is ScrollView || view.canScrollVertically(1) || view.canScrollVertically(-1))
+            ) return true
+            if (view is ViewGroup) for (i in 0 until view.childCount) if (scan(view.getChildAt(i))) return true
+            return false
+        }
+        return bodyChild?.let { scan(it) } ?: false
     }
 
     /** [velocity] in px/s of [visible] (positive = growing). */
@@ -637,7 +820,7 @@ class SheetLayerView(
         val heights = resolvedHeights()
         if (heights.isEmpty()) return
         val projected = visible + velocity * 0.12f
-        val lowest = heights.minOrNull() ?: 0f
+        val lowest = heights.first()
         val flickDown = velocity < -dp(1500f) && visible <= lowest + 1f
         if (panToDismiss && (projected < lowest * 0.5f || flickDown)) {
             dismiss("drag")
@@ -653,12 +836,17 @@ class SheetLayerView(
             }
         }
         currentIndex = best
+        temporaryTarget = null
+        // The user moved the sheet by hand: a later keyboard restore would
+        // fight that, so forget the pre-keyboard detent.
+        indexBeforeKeyboard = null
         settleToCurrent(velocity)
     }
 
     private fun emitDragStart() {
         if (dragEmittedStart) return
         dragEmittedStart = true
+        temporaryTarget = null
         if (dismissKeyboardOnDrag && keyboardLift > 0f) hideKeyboard()
         owner.onDragStart?.invoke()
     }
@@ -679,9 +867,13 @@ class SheetLayerView(
 
     private fun emitLayout(phase: Int) {
         if (!presented) return
-        val sheet = resolvedHeight(currentIndex)
-        val body = if (isAuto(currentIndex)) -1f else max(0f, sheet - grabberArea - footerHeight)
-        val next = Emitted(currentIndex, sheet, body, maxBodyHeight(), footerHeight, keyboardLift, phase)
+        val sheet = targetHeight()
+        val dynamic = temporaryTarget == null && isAuto(currentIndex)
+        val body = if (dynamic) -1f else max(0f, sheet - handleArea - footerHeight)
+        val next = Emitted(
+            currentIndex, sheet, body, maxBodyHeight(), footerHeight, keyboardLift,
+            height.toFloat(), if (dynamic) 1 else 0, phase,
+        )
         if (next == lastEmitted) return
         lastEmitted = next
         owner.onLayoutChange?.invoke(
@@ -691,8 +883,35 @@ class SheetLayerView(
             if (next.maxBody < 0f) -1f else px(next.maxBody),
             px(next.footer),
             px(next.keyboard),
+            px(next.host),
+            next.dynamic,
             next.phase,
         )
+    }
+
+    // MARK: - Live position (per frame, only when armed)
+
+    /** gorhom's fractional `animatedIndex` for a visible height. */
+    private fun fractionalIndex(v: Float): Float {
+        val heights = resolvedHeights()
+        val first = heights.firstOrNull() ?: return if (v > 0f) 0f else -1f
+        if (first <= 0f) return if (v > 0f) 0f else -1f
+        if (v <= 0f) return -1f
+        if (v < first) return -1f + v / first
+        for (i in 0 until heights.size - 1) {
+            val lo = heights[i]
+            val hi = heights[i + 1]
+            if (v < hi) return if (hi > lo) i + (v - lo) / (hi - lo) else i.toFloat()
+        }
+        return (heights.size - 1).toFloat()
+    }
+
+    private fun emitPosition() {
+        if (!positionEvents || height == 0) return
+        val position = container.translationY
+        if (!lastPosition.isNaN() && abs(position - lastPosition) < 0.5f) return
+        lastPosition = position
+        owner.onPositionChange?.invoke(px(position), fractionalIndex(visible), px(visible))
     }
 
     // MARK: - Backdrop / back / keyboard
@@ -713,7 +932,7 @@ class SheetLayerView(
             override fun handleOnBackProgressed(backEvent: BackEventCompat) {
                 if (Build.VERSION.SDK_INT < 34) return
                 cancelSpring()
-                setVisibleRaw(resolvedHeight(currentIndex) * (1f - 0.12f * backEvent.progress))
+                setVisibleRaw(targetHeight() * (1f - 0.12f * backEvent.progress))
             }
 
             override fun handleOnBackCancelled() {
@@ -737,16 +956,31 @@ class SheetLayerView(
     /** The IME inset is measured from the window's bottom edge — used as-is. */
     private fun applyIme(bottomPx: Int) {
         if (keyboardMode == "none") return
-        val lift = max(0f, bottomPx - bottomInset)
+        // The content's own bottom padding is spent over the keyboard.
+        val lift = max(0f, bottomPx - bottomInset - contentBottomInset)
         if (lift == keyboardLift) return
         keyboardLift = lift
         // 'lift-sheet' moves the container, 'lift-footer' only the footer slot.
         applyVisible()
-        // The keyboard opening takes the sheet to its top detent (IG
-        // comments); the spring runs alongside the IME's own animation.
-        if (lift > 0 && presented && expandOnKeyboard && currentIndex != topIndex()) {
-            currentIndex = topIndex()
-            settleToCurrent(0f)
+        if (!presented) return
+        if (lift > 0f) {
+            // The keyboard opening takes the sheet to its top detent (IG
+            // comments); the spring runs alongside the IME's own animation.
+            if (expandOnKeyboard && currentIndex != topIndex()) {
+                if (indexBeforeKeyboard == null) indexBeforeKeyboard = currentIndex
+                currentIndex = topIndex()
+                temporaryTarget = null
+                settleToCurrent(0f)
+            }
+        } else {
+            // gorhom's `keyboardBlurBehavior="restore"`.
+            val before = indexBeforeKeyboard
+            indexBeforeKeyboard = null
+            if (restoreOnKeyboardHide && before != null) {
+                currentIndex = clampIndex(before)
+                temporaryTarget = null
+                settleToCurrent(0f)
+            }
         }
     }
 
@@ -771,7 +1005,7 @@ class SheetLayerView(
     private var nestedLockContent = false
 
     override fun onStartNestedScroll(child: View, target: View, axes: Int, type: Int): Boolean =
-        (axes and ViewCompat.SCROLL_AXIS_VERTICAL) != 0 && type == ViewCompat.TYPE_TOUCH
+        contentPanning && (axes and ViewCompat.SCROLL_AXIS_VERTICAL) != 0 && type == ViewCompat.TYPE_TOUCH
 
     override fun onNestedScrollAccepted(child: View, target: View, axes: Int, type: Int) {
         nestedHelper.onNestedScrollAccepted(child, target, axes, type)
@@ -882,10 +1116,12 @@ class SheetLayerView(
         private var tracker: VelocityTracker? = null
         private var downRawX = 0f
         private var downRawY = 0f
+        private var downLocalY = 0f
         private var dragAnchorRawY = 0f
         private var dragStartVisible = 0f
         private var dragging = false
         private var touchOnScrollable = false
+        private var topOverDragAllowed = false
 
         init {
             clipChildren = true
@@ -893,8 +1129,10 @@ class SheetLayerView(
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     // Bottom corners live in the off-screen overshoot, so a
-                    // uniform radius reads as top-only.
-                    outline.setRoundRect(0, 0, view.width, view.height, cornerRadius)
+                    // uniform radius reads as top-only — unless detached, where
+                    // the outline is cut to the visible height so all four show.
+                    val h = if (detached) max(1, visible.roundToInt()) else view.height
+                    outline.setRoundRect(0, 0, view.width, h, cornerRadius)
                 }
             }
         }
@@ -914,6 +1152,10 @@ class SheetLayerView(
             tracker = null
         }
 
+        /** gorhom's handle / content panning switches, by the band the touch started in. */
+        private fun bandAllowsDrag(): Boolean =
+            if (downLocalY < handleArea) handlePanning else contentPanning
+
         // Touches that start on a nested-scrolling list are left alone — the
         // hand-off for those rides on NestedScrollingParent3. Everything else
         // (grabber, header rows, the footer) is dragged directly.
@@ -922,6 +1164,7 @@ class SheetLayerView(
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = ev.rawX
                     downRawY = ev.rawY
+                    downLocalY = ev.y
                     dragging = false
                     cancelSpring()
                     touchOnScrollable = findNestedScrollableUnder(this, ev.x, ev.y) != null
@@ -930,7 +1173,7 @@ class SheetLayerView(
                 }
                 MotionEvent.ACTION_MOVE -> {
                     tracker?.addMovement(ev)
-                    if (touchOnScrollable || !presented) return false
+                    if (touchOnScrollable || !presented || !bandAllowsDrag()) return false
                     val dy = ev.rawY - downRawY
                     val dx = ev.rawX - downRawX
                     if (!dragging && abs(dy) > slop && abs(dy) > abs(dx)) {
@@ -952,6 +1195,7 @@ class SheetLayerView(
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = ev.rawX
                     downRawY = ev.rawY
+                    downLocalY = ev.y
                     dragging = false
                     touchOnScrollable = false
                     cancelSpring()
@@ -959,12 +1203,12 @@ class SheetLayerView(
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (!presented) return true
-                    if (!dragging) {
+                    if (!dragging && bandAllowsDrag()) {
                         val dy = ev.rawY - downRawY
                         val dx = ev.rawX - downRawX
                         if (abs(dy) > slop && abs(dy) > abs(dx)) beginDrag(ev)
                     }
-                    if (dragging) applyDrag(dragStartVisible - (ev.rawY - dragAnchorRawY))
+                    if (dragging) applyDrag(dragStartVisible - (ev.rawY - dragAnchorRawY), topOverDragAllowed)
                 }
                 MotionEvent.ACTION_UP -> {
                     if (dragging) {
@@ -993,6 +1237,7 @@ class SheetLayerView(
             dragging = true
             dragAnchorRawY = ev.rawY
             dragStartVisible = visible
+            topOverDragAllowed = downLocalY < handleArea || !bodyHasScrollable()
             parent?.requestDisallowInterceptTouchEvent(true)
             // React's JS touch is still live under the finger: cancel it so a
             // Pressable does not fire on release (what ReactScrollView does

@@ -8,16 +8,19 @@ import UIKit
 /// a `SheetLayerView` (dim + sheet container + slots) and attaches it to the
 /// hosting screen's own native view — the OUTERMOST `RNSScreenView` on the
 /// way up (the main-stack screen that hosts the whole tab navigator), so the
-/// sheet covers the tab bar but sits BELOW anything the stack pushes. Body
-/// and footer children are moved into the container's slots; Fabric keeps
-/// owning their layout (bounds + center at (0,0) inside the slot), we only
-/// move the slots.
+/// sheet covers the tab bar but sits BELOW anything the stack pushes — or,
+/// in modal mode, to React Native's root surface view above every screen.
+/// Body, footer and handle children are moved into the container's slots;
+/// Fabric keeps owning their layout (bounds + center at (0,0) inside the
+/// slot), we only move the slots.
 ///
 /// Geometry (points, layer-relative), driven by `visibleHeight`:
 ///
-///   container : (0, H - visible, W, H + overshoot)   — full height so the
+///   container : (m, H - visible, W - 2m, H + overshoot)  — full height so the
 ///               background never shows a gap under a spring overshoot
-///   bodySlot  : (0, grabberArea, W, footerTop - grabberArea), clips
+///               (detached: height = visible, all corners rounded)
+///   handleSlot: (0, 0, W, handleArea)
+///   bodySlot  : (0, handleArea, W, footerTop - handleArea), clips
 ///   footerSlot: (0, footerTop, W, footerH) with
 ///               footerTop = visible - keyboardLift - footerH   ('lift-footer')
 ///   'lift-sheet': the whole container rises by the keyboard instead
@@ -35,8 +38,10 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   @objc public var onDismiss: ((String) -> Void)?
   @objc public var onDragStart: (() -> Void)?
   @objc public var onDragEnd: (() -> Void)?
-  /// (index, sheetHeight, bodyHeight (-1 = auto), maxBodyHeight (-1 = all auto), footerHeight, keyboardHeight, phase)
-  @objc public var onLayoutChange: ((Int, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, Int) -> Void)?
+  /// (index, sheetHeight, bodyHeight (-1 = auto), maxBodyHeight (-1 = all auto), footerHeight, keyboardHeight, hostHeight, dynamic, phase)
+  @objc public var onLayoutChange: ((Int, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, Int, Int) -> Void)?
+  /// (position, fractional index, visible height) — per frame while moving, only when armed.
+  @objc public var onPositionChange: ((CGFloat, CGFloat, CGFloat) -> Void)?
   /// Provided by the host: cancels React's in-flight JS touches so a press
   /// under the finger never fires once the sheet owns the drag.
   @objc public var cancelReactTouches: (() -> Void)?
@@ -57,41 +62,60 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private var initialDetent = 0
   private var maxDetentInset: CGFloat = 0
   private var bottomInset: CGFloat = 0
+  private var maxAutoHeight: CGFloat = 0
+  private var contentBottomInset: CGFloat = 0
   private var dimmed = true
   private var dimOpacity: CGFloat = 0.5
   private var dimColor: UIColor = .black
-  private var cornerRadius: CGFloat = 24
+  private var cornerRadius: CGFloat = 15
   private var grabberVisible = true
-  private var grabberAreaHeight: CGFloat = 22
-  private var sheetBackgroundColor: UIColor = .systemBackground
-  private var grabberColor: UIColor = UIColor.secondaryLabel.withAlphaComponent(0.5)
-  private var grabberSize = CGSize(width: 36, height: 5)
+  private var grabberAreaHeight: CGFloat = 24
+  private var sheetBackgroundColor: UIColor = .white
+  private var grabberColor: UIColor = UIColor.black.withAlphaComponent(0.75)
+  private var grabberSize = CGSize(width: 30, height: 4)
   private var panToDismiss = true
   private var dismissOnBackdrop = true
-  private var keyboardMode = "lift-footer"
-  private var expandOnKeyboard = true
-  private var dismissKeyboardOnDrag = true
+  private var contentPanning = true
+  private var handlePanning = true
+  private var overDrag = true
+  private var overDragResistance: CGFloat = 2.5
+  private var keyboardMode = "lift-sheet"
+  private var expandOnKeyboard = false
+  private var restoreOnKeyboardHide = false
+  private var dismissKeyboardOnDrag = false
+  private var detached = false
+  private var detachedMargin: CGFloat = 0
   private var hostStrategy = "outermost-screen"
+  private var positionEvents = false
 
   // MARK: - React children
 
   private weak var bodyChild: UIView?
   private weak var footerChild: UIView?
+  private weak var handleChild: UIView?
   private var bodyObservation: NSKeyValueObservation?
   private var footerObservation: NSKeyValueObservation?
+  private var handleObservation: NSKeyValueObservation?
   /// The body's Fabric-assigned height — what an `auto` detent measures.
   private var bodyAutoHeight: CGFloat = 0
   private var footerHeight: CGFloat = 0
+  private var handleHeight: CGFloat = 0
 
   // MARK: - Sheet state
 
   private var sheetLayer: SheetLayerView?
   private var isPresented = false
   private var currentIndex = 0
+  /// A `snapToHeight` target that is not a detent (gorhom's temporary position).
+  private var temporaryTarget: CGFloat?
   private var visibleHeight: CGFloat = 0
   private var keyboardLift: CGFloat = 0
+  /// Where the sheet sat before the keyboard expanded it (for the restore).
+  private var indexBeforeKeyboard: Int?
   /// Bumped on every new animation so a superseded completion is ignored.
   private var animationGeneration = 0
+  private var displayLink: CADisplayLink?
+  private var lastPosition: CGFloat = .nan
 
   private struct Emitted: Equatable {
     var index: Int
@@ -100,6 +124,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     var maxBody: CGFloat
     var footer: CGFloat
     var keyboard: CGFloat
+    var host: CGFloat
+    var dynamic: Int
     var phase: Int
   }
   private var lastEmitted: Emitted?
@@ -112,6 +138,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private var dragStartHeight: CGFloat = 0
   private var dragScrollView: UIScrollView?
   private var dragTouchInScroll = false
+  /// The touch began in the handle band (gorhom's GESTURE_SOURCE.HANDLE).
+  private var dragInHandle = false
   private var lastTranslationY: CGFloat = 0
   private var dragEmittedStart = false
   /// The body's main scroll view, kept at offset 0 whenever the sheet is not
@@ -147,6 +175,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
 
   deinit {
     NotificationCenter.default.removeObserver(self)
+    displayLink?.invalidate()
   }
 
   // MARK: - Props
@@ -161,6 +190,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     detents = parsed.isEmpty ? [.auto] : parsed
     guard isPresented else { return }
     currentIndex = min(currentIndex, detents.count - 1)
+    temporaryTarget = nil
     settleToCurrent(velocity: 0)
   }
 
@@ -172,6 +202,11 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   @objc public func setBottomInset(_ inset: CGFloat) {
     bottomInset = inset
     if isPresented { settleToCurrent(velocity: 0) }
+  }
+  @objc public func setContentBottomInset(_ value: CGFloat) { contentBottomInset = max(0, value) }
+  @objc public func setMaxAutoHeight(_ value: CGFloat) {
+    maxAutoHeight = value
+    if isPresented, isAuto(currentIndex) { settleToCurrent(velocity: 0) }
   }
   @objc public func setDimColor(_ color: UIColor?) { dimColor = color ?? .black; applyChrome() }
   @objc public func setGrabberWidth(_ value: CGFloat) { grabberSize.width = value; layoutSheet() }
@@ -190,19 +225,34 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     if isPresented { emitLayout(phase: 1) }
   }
   @objc public func setSheetBackgroundColor(_ color: UIColor?) {
-    sheetBackgroundColor = color ?? .systemBackground
+    sheetBackgroundColor = color ?? .white
     applyChrome()
   }
   @objc public func setGrabberColor(_ color: UIColor?) {
-    grabberColor = color ?? UIColor.secondaryLabel.withAlphaComponent(0.5)
+    grabberColor = color ?? UIColor.black.withAlphaComponent(0.75)
     applyChrome()
   }
   @objc public func setEnablePanToDismiss(_ value: Bool) { panToDismiss = value }
   @objc public func setDismissOnBackdropPress(_ value: Bool) { dismissOnBackdrop = value }
+  @objc public func setEnableContentPanningGesture(_ value: Bool) {
+    contentPanning = value
+    refreshContentLock()
+  }
+  @objc public func setEnableHandlePanningGesture(_ value: Bool) { handlePanning = value }
+  @objc public func setEnableOverDrag(_ value: Bool) { overDrag = value }
+  @objc public func setOverDragResistanceFactor(_ value: CGFloat) { overDragResistance = max(1, value) }
   @objc public func setKeyboardMode(_ value: String) { keyboardMode = value }
   @objc public func setExpandOnKeyboard(_ value: Bool) { expandOnKeyboard = value }
+  @objc public func setRestoreDetentOnKeyboardHide(_ value: Bool) { restoreOnKeyboardHide = value }
   @objc public func setDismissKeyboardOnDrag(_ value: Bool) { dismissKeyboardOnDrag = value }
+  @objc public func setDetached(_ value: Bool) { detached = value; applyChrome(); layoutSheet() }
+  @objc public func setDetachedMargin(_ value: CGFloat) { detachedMargin = max(0, value); layoutSheet() }
   @objc public func setHostStrategy(_ value: String) { hostStrategy = value }
+  @objc public func setPositionEventsEnabled(_ value: Bool) {
+    positionEvents = value
+    lastPosition = .nan
+    if value, isPresented { emitPosition() }
+  }
 
   // MARK: - Children
 
@@ -225,6 +275,14 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
         DispatchQueue.main.async { self?.footerHeightChanged(height) }
       }
       (slotIfPresented(\.footerSlot) ?? self).addSubview(child)
+    case "sheet-handle":
+      handleChild = child
+      handleObservation = child.layer.observe(\.bounds, options: [.initial, .new]) { [weak self] layer, _ in
+        let height = layer.bounds.height
+        DispatchQueue.main.async { self?.handleHeightChanged(height) }
+      }
+      (slotIfPresented(\.handleSlot) ?? self).addSubview(child)
+      layoutSheet()
     default:
       addSubview(child)
     }
@@ -242,6 +300,13 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       footerHeight = 0
       layoutSheet()
     }
+    if handleChild === child {
+      handleObservation = nil
+      handleChild = nil
+      handleHeight = 0
+      layoutSheet()
+      if isPresented { emitLayout(phase: 1) }
+    }
     child.removeFromSuperview()
   }
 
@@ -254,6 +319,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     guard let layer = sheetLayer else { return }
     if let body = bodyChild, body.superview !== layer.bodySlot { layer.bodySlot.addSubview(body) }
     if let footer = footerChild, footer.superview !== layer.footerSlot { layer.footerSlot.addSubview(footer) }
+    if let handle = handleChild, handle.superview !== layer.handleSlot { layer.handleSlot.addSubview(handle) }
   }
 
   private func bodyHeightChanged(_ height: CGFloat) {
@@ -276,9 +342,21 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
   }
 
+  private func handleHeightChanged(_ height: CGFloat) {
+    guard abs(height - handleHeight) > 0.5 else { return }
+    handleHeight = height
+    layoutSheet()
+    guard isPresented else { return }
+    if isAuto(currentIndex) {
+      settleToCurrent(velocity: 0)
+    } else {
+      emitLayout(phase: 1)
+    }
+  }
+
   // MARK: - Commands
 
-  @objc public func present(_ index: Int) {
+  @objc public func present(_ index: Int, animated: Bool) {
     guard let host = resolveHost() else { return }
     let layer = sheetLayer ?? makeLayer()
     if layer.superview !== host {
@@ -298,14 +376,28 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     let wasPresented = isPresented
     isPresented = true
     currentIndex = clampIndex(index)
+    temporaryTarget = nil
+    indexBeforeKeyboard = nil
     if !wasPresented {
       visibleHeight = 0
       keyboardLift = 0
       lastEmitted = nil
+      lastPosition = .nan
       layoutSheet()
       onPresent?()
     }
-    settleToCurrent(velocity: 0)
+    if animated {
+      settleToCurrent(velocity: 0)
+    } else {
+      animationGeneration += 1
+      contentUnlocked = false
+      emitLayout(phase: 0)
+      visibleHeight = targetHeight()
+      layoutSheet()
+      contentUnlocked = atTopTarget()
+      emitLayout(phase: 1)
+      emitPosition()
+    }
   }
 
   @objc public func dismiss() {
@@ -315,12 +407,32 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   @objc public func snapTo(_ index: Int) {
     guard isPresented else { return }
     currentIndex = clampIndex(index)
+    temporaryTarget = nil
+    indexBeforeKeyboard = nil
+    settleToCurrent(velocity: 0)
+  }
+
+  /// gorhom's `snapToPosition`: any height, expressed like one detent token.
+  @objc public func snapToHeight(_ spec: String) {
+    guard isPresented else { return }
+    let t = spec.trimmingCharacters(in: .whitespaces)
+    guard let v = Double(t), v > 0 else { return }
+    let available = availableHeight()
+    let height = v <= 1 ? CGFloat(v) * available : min(CGFloat(v), available)
+    // The nearest detent at or below is what `index` reports meanwhile.
+    let heights = resolvedHeights
+    var nearest = 0
+    for (i, h) in heights.enumerated() where h <= height + 0.5 { nearest = i }
+    currentIndex = nearest
+    temporaryTarget = height
+    indexBeforeKeyboard = nil
     settleToCurrent(velocity: 0)
   }
 
   /// Recycled / unmounted by Fabric: tear everything down synchronously.
   @objc public func reset() {
     animationGeneration += 1
+    stopDisplayLink()
     contentUnlocked = false
     lockObservation = nil
     lockedScrollView = nil
@@ -335,16 +447,23 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     sheetPan = nil
     bodyObservation = nil
     footerObservation = nil
+    handleObservation = nil
     bodyChild?.removeFromSuperview()
     footerChild?.removeFromSuperview()
+    handleChild?.removeFromSuperview()
     bodyChild = nil
     footerChild = nil
+    handleChild = nil
     bodyAutoHeight = 0
     footerHeight = 0
+    handleHeight = 0
     visibleHeight = 0
     keyboardLift = 0
     currentIndex = 0
+    temporaryTarget = nil
+    indexBeforeKeyboard = nil
     lastEmitted = nil
+    lastPosition = .nan
   }
 
   private func dismiss(reason: String) {
@@ -355,6 +474,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     lockedScrollView = nil
     dragOwner = .undecided
     dragScrollView = nil
+    temporaryTarget = nil
+    indexBeforeKeyboard = nil
     if dragEmittedStart {
       dragEmittedStart = false
       onDragEnd?()
@@ -371,27 +492,30 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   }
 
   // MARK: - Detents
+  // Detents are given in the author's order but every index in the contract
+  // refers to the order of their RESOLVED heights (gorhom sorts its snap
+  // points the same way once a dynamic content height joins them).
 
-  private var grabberArea: CGFloat { grabberVisible ? grabberAreaHeight : 0 }
+  private var handleArea: CGFloat {
+    if handleChild != nil { return handleHeight }
+    return grabberVisible ? grabberAreaHeight : 0
+  }
 
   private func clampIndex(_ index: Int) -> Int {
     max(0, min(index, detents.count - 1))
-  }
-
-  private func isAuto(_ index: Int) -> Bool {
-    if case .auto = detents[clampIndex(index)] { return true }
-    return false
   }
 
   private func availableHeight() -> CGFloat {
     max(0, (sheetLayer?.bounds.height ?? 0) - maxDetentInset - bottomInset)
   }
 
-  private func resolvedHeight(_ index: Int) -> CGFloat {
+  /// Height of the detent at its AUTHORED position.
+  private func rawHeight(_ rawIndex: Int) -> CGFloat {
     let available = availableHeight()
-    switch detents[clampIndex(index)] {
+    switch detents[rawIndex] {
     case .auto:
-      return min(available, bodyAutoHeight + grabberArea + footerHeight)
+      let cap = maxAutoHeight > 0 ? min(available, maxAutoHeight) : available
+      return min(cap, bodyAutoHeight + handleArea + footerHeight)
     case .fraction(let f):
       return f * available
     case .points(let p):
@@ -399,20 +523,35 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
   }
 
-  private var resolvedHeights: [CGFloat] { detents.indices.map(resolvedHeight) }
+  /// Authored indices sorted by resolved height (stable).
+  private var sortedOrder: [Int] {
+    let raw = detents.indices.map(rawHeight)
+    return detents.indices.sorted { a, b in raw[a] == raw[b] ? a < b : raw[a] < raw[b] }
+  }
+
+  private func isAuto(_ index: Int) -> Bool {
+    if case .auto = detents[sortedOrder[clampIndex(index)]] { return true }
+    return false
+  }
+
+  private func resolvedHeight(_ index: Int) -> CGFloat {
+    rawHeight(sortedOrder[clampIndex(index)])
+  }
+
+  /// Ascending.
+  private var resolvedHeights: [CGFloat] { detents.indices.map(rawHeight).sorted() }
   /// Body height at the tallest non-auto detent; -1 when every detent is auto.
   private var maxBodyHeight: CGFloat {
-    let fixed = detents.indices.filter { !isAuto($0) }.map(resolvedHeight)
+    let fixed = detents.indices.filter { if case .auto = detents[$0] { return false }; return true }.map(rawHeight)
     guard let top = fixed.max() else { return -1 }
-    return max(0, top - grabberArea - footerHeight)
+    return max(0, top - handleArea - footerHeight)
   }
-  private var topHeight: CGFloat { resolvedHeights.max() ?? 0 }
-  private var topIndex: Int {
-    let heights = resolvedHeights
-    guard let maxHeight = heights.max(), let index = heights.firstIndex(of: maxHeight) else { return 0 }
-    return index
-  }
-  private var bottomHeight: CGFloat { resolvedHeights.min() ?? 0 }
+  private var topHeight: CGFloat { resolvedHeights.last ?? 0 }
+  private var topIndex: Int { max(0, detents.count - 1) }
+  private var bottomHeight: CGFloat { resolvedHeights.first ?? 0 }
+  /// Where the sheet is heading: a temporary height or the current detent.
+  private func targetHeight() -> CGFloat { temporaryTarget ?? resolvedHeight(currentIndex) }
+  private func atTopTarget() -> Bool { targetHeight() >= topHeight - 0.5 }
 
   // MARK: - Layer + layout
 
@@ -438,6 +577,9 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     guard let layer = sheetLayer else { return }
     layer.container.backgroundColor = sheetBackgroundColor
     layer.container.layer.cornerRadius = cornerRadius
+    layer.container.layer.maskedCorners = detached
+      ? [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+      : [.layerMinXMinYCorner, .layerMaxXMinYCorner]
     layer.dimView.backgroundColor = dimColor
     layer.grabber.backgroundColor = grabberColor
     layer.grabber.layer.cornerRadius = grabberSize.height / 2
@@ -451,9 +593,16 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     return max(0, min(keyboardLift, room))
   }
 
-  /// The footer's own lift (only in 'lift-footer' mode).
+  /// The footer's own lift: all of the keyboard in 'lift-footer' mode; in
+  /// 'lift-sheet' mode whatever the sheet itself could not rise (a sheet
+  /// already at the top inset cannot move, so the footer clears the keyboard
+  /// on its own — what gorhom's footer does in every keyboard behaviour).
   private func footerKeyboardLift() -> CGFloat {
-    keyboardMode == "lift-footer" ? keyboardLift : 0
+    switch keyboardMode {
+    case "lift-footer": return keyboardLift
+    case "lift-sheet": return max(0, keyboardLift - sheetKeyboardLift())
+    default: return 0
+    }
   }
 
   fileprivate func layoutSheet() {
@@ -468,21 +617,26 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
 
     // `bottomInset` lifts the resting bottom edge (above a tab bar, say);
     // everything else is measured from that edge.
+    let margin = detached ? detachedMargin : 0
+    let cw = max(0, w - 2 * margin)
     layer.container.frame = CGRect(
-      x: 0, y: h - bottomInset - visibleHeight - sheetKeyboardLift(),
-      width: w, height: h + Self.overshoot)
-    layer.grabber.isHidden = !grabberVisible
+      x: margin, y: h - bottomInset - visibleHeight - sheetKeyboardLift(),
+      width: cw, height: detached ? max(0, visibleHeight) : h + Self.overshoot)
+    let area = handleArea
+    layer.grabber.isHidden = !grabberVisible || handleChild != nil
     layer.grabber.frame = CGRect(
-      x: (w - grabberSize.width) / 2, y: 8,
+      x: (cw - grabberSize.width) / 2, y: 8,
       width: grabberSize.width, height: grabberSize.height)
+    layer.handleSlot.frame = CGRect(x: 0, y: 0, width: cw, height: handleChild != nil ? handleHeight : 0)
     // Pinned to the screen's bottom edge while the sheet sits at or above its
     // lowest detent; below that (dragging to dismiss, the slide in/out) it
     // stays anchored at the lowest detent and travels with the sheet — the
     // Instagram footer.
     let anchor = max(visibleHeight, bottomHeight)
     let footerTop = max(0, anchor - footerKeyboardLift() - footerHeight)
-    layer.footerSlot.frame = CGRect(x: 0, y: footerTop, width: w, height: footerHeight)
-    layer.bodySlot.frame = CGRect(x: 0, y: grabberArea, width: w, height: max(0, footerTop - grabberArea))
+    layer.footerSlot.frame = CGRect(x: 0, y: footerTop, width: cw, height: footerHeight)
+    layer.bodySlot.frame = CGRect(x: 0, y: area, width: cw, height: max(0, footerTop - area))
+    emitPosition()
   }
 
   fileprivate var blocksBackdropTouches: Bool { isPresented && dimmed }
@@ -491,24 +645,37 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     var probe: UIView? = superview
     var nearest: UIView?
     var outermost: UIView?
+    var root: UIView?
     while let view = probe {
-      if String(describing: type(of: view)) == "RNSScreenView" {
+      let name = String(describing: type(of: view))
+      if name == "RNSScreenView" {
         if nearest == nil { nearest = view }
         outermost = view
+      } else if name == "RCTSurfaceView" {
+        // React Native's root surface view: RN's touch handler is attached
+        // here, so a sheet parented to it is above every screen AND still
+        // receives React touches.
+        root = view
       }
       probe = view.superview
     }
-    return (hostStrategy == "nearest-screen" ? nearest : outermost) ?? window
+    switch hostStrategy {
+    case "nearest-screen": return nearest ?? outermost ?? root ?? window
+    case "root": return root ?? window
+    default: return outermost ?? root ?? window
+    }
   }
 
   // MARK: - Animation
 
+  private var reduceMotion: Bool { UIAccessibility.isReduceMotionEnabled }
+
   private func settleToCurrent(velocity: CGFloat) {
     contentUnlocked = false
     emitLayout(phase: 0)
-    animate(to: resolvedHeight(currentIndex), velocity: velocity) { [weak self] finished in
+    animate(to: targetHeight(), velocity: velocity) { [weak self] finished in
       guard let self, finished, self.isPresented else { return }
-      self.contentUnlocked = self.currentIndex == self.topIndex
+      self.contentUnlocked = self.atTopTarget()
       self.emitLayout(phase: 1)
     }
   }
@@ -518,19 +685,31 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     let generation = animationGeneration
     let distance = abs(target - visibleHeight)
     let springVelocity = distance > 1 ? min(abs(velocity) / distance, 12) : 0
+    startDisplayLinkIfNeeded()
+    let animations = {
+      self.visibleHeight = target
+      self.layoutSheet()
+    }
+    let done: (Bool) -> Void = { finished in
+      guard generation == self.animationGeneration else { return }
+      completion?(finished)
+    }
+    if reduceMotion {
+      // Honour the system setting: a short fade-free ease, no spring.
+      UIView.animate(
+        withDuration: 0.15, delay: 0,
+        options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseOut],
+        animations: animations, completion: done)
+      return
+    }
     UIView.animate(
       withDuration: 0.5,
       delay: 0,
       usingSpringWithDamping: 0.86,
       initialSpringVelocity: springVelocity,
-      options: [.allowUserInteraction, .beginFromCurrentState]
-    ) {
-      self.visibleHeight = target
-      self.layoutSheet()
-    } completion: { finished in
-      guard generation == self.animationGeneration else { return }
-      completion?(finished)
-    }
+      options: [.allowUserInteraction, .beginFromCurrentState],
+      animations: animations,
+      completion: done)
   }
 
   /// A finger landed mid-spring: freeze the model at the presentation value.
@@ -540,21 +719,80 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       visibleHeight = max(0, layer.bounds.height - bottomInset - sheetKeyboardLift() - presentation.frame.minY)
     }
     animationGeneration += 1
-    [layer.container, layer.dimView, layer.grabber, layer.bodySlot, layer.footerSlot]
+    [layer.container, layer.dimView, layer.grabber, layer.handleSlot, layer.bodySlot, layer.footerSlot]
       .forEach { $0.layer.removeAllAnimations() }
     layoutSheet()
   }
 
   private func emitLayout(phase: Int) {
     guard isPresented else { return }
-    let sheet = resolvedHeight(currentIndex)
-    let body: CGFloat = isAuto(currentIndex) ? -1 : max(0, sheet - grabberArea - footerHeight)
+    let sheet = targetHeight()
+    let dynamic = temporaryTarget == nil && isAuto(currentIndex)
+    let body: CGFloat = dynamic ? -1 : max(0, sheet - handleArea - footerHeight)
     let next = Emitted(
       index: currentIndex, sheet: sheet, body: body, maxBody: maxBodyHeight,
-      footer: footerHeight, keyboard: keyboardLift, phase: phase)
+      footer: footerHeight, keyboard: keyboardLift, host: sheetLayer?.bounds.height ?? 0,
+      dynamic: dynamic ? 1 : 0, phase: phase)
     if next == lastEmitted { return }
     lastEmitted = next
-    onLayoutChange?(next.index, next.sheet, next.body, next.maxBody, next.footer, next.keyboard, next.phase)
+    onLayoutChange?(
+      next.index, next.sheet, next.body, next.maxBody, next.footer, next.keyboard, next.host, next.dynamic,
+      next.phase)
+  }
+
+  // MARK: - Live position (per frame, only when armed)
+
+  /// gorhom's fractional `animatedIndex` for a visible height.
+  private func fractionalIndex(for visible: CGFloat) -> CGFloat {
+    let heights = resolvedHeights
+    guard let first = heights.first, first > 0 else { return visible > 0 ? 0 : -1 }
+    if visible <= 0 { return -1 }
+    if visible < first { return -1 + visible / first }
+    for i in 0..<(heights.count - 1) {
+      let lo = heights[i]
+      let hi = heights[i + 1]
+      if visible < hi {
+        return hi > lo ? CGFloat(i) + (visible - lo) / (hi - lo) : CGFloat(i)
+      }
+    }
+    return CGFloat(heights.count - 1)
+  }
+
+  /// Emit from the model value (drag, and the final frame of an animation).
+  private func emitPosition() {
+    guard positionEvents, isPresented || visibleHeight > 0, let layer = sheetLayer else { return }
+    let position = layer.container.frame.minY
+    emitPosition(position: position, visible: visibleHeight)
+  }
+
+  private func emitPosition(position: CGFloat, visible: CGFloat) {
+    guard positionEvents else { return }
+    if !lastPosition.isNaN, abs(position - lastPosition) < 0.05 { return }
+    lastPosition = position
+    onPositionChange?(position, fractionalIndex(for: visible), visible)
+  }
+
+  /// Inside a UIView animation the model is already at the target, so the
+  /// presentation layer is sampled per frame while anything animates.
+  private func startDisplayLinkIfNeeded() {
+    guard positionEvents, displayLink == nil else { return }
+    let link = CADisplayLink(target: self, selector: #selector(displayLinkTick))
+    link.add(to: .main, forMode: .common)
+    displayLink = link
+  }
+
+  private func stopDisplayLink() {
+    displayLink?.invalidate()
+    displayLink = nil
+  }
+
+  @objc private func displayLinkTick() {
+    guard let layer = sheetLayer, layer.superview != nil else { stopDisplayLink(); return }
+    let animating = !(layer.container.layer.animationKeys()?.isEmpty ?? true)
+    let minY = layer.container.layer.presentation()?.frame.minY ?? layer.container.frame.minY
+    let visible = max(0, layer.bounds.height - bottomInset - sheetKeyboardLift() - minY)
+    emitPosition(position: minY, visible: visible)
+    if !animating { stopDisplayLink() }
   }
 
   // MARK: - Drag
@@ -568,7 +806,9 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       dragOwner = .undecided
       dragStartHeight = visibleHeight
       lastTranslationY = 0
-      dragScrollView = resolveScrollView()
+      temporaryTarget = nil
+      dragScrollView = contentPanning ? resolveScrollView() : nil
+      dragInHandle = pan.location(in: layer.container).y < handleArea
       if let scrollView = dragScrollView {
         dragTouchInScroll = scrollView.bounds.contains(pan.location(in: scrollView))
       } else {
@@ -583,12 +823,12 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       // top, treat it as expanded now — otherwise this gesture would be
       // spent on a sheet that cannot rise, and the list would feel stuck.
       if visibleHeight >= topHeight - 0.5 {
-        visibleHeight = topHeight
+        visibleHeight = min(visibleHeight, topHeight)
         currentIndex = topIndex
         contentUnlocked = true
         layoutSheet()
       }
-      if !contentUnlocked {
+      if !contentUnlocked || !contentPanning {
         dragOwner = .sheet
         beginSheetOwnership()
       }
@@ -665,15 +905,22 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
   }
 
+  /// gorhom's over-drag curve: the excess collapses to `sqrt(1 + excess) × factor`.
+  private func resist(_ excess: CGFloat) -> CGFloat {
+    (1 + max(0, excess)).squareRoot() * overDragResistance
+  }
+
   private func applyDrag(height: CGFloat) {
     var target = height
     let top = topHeight
     let bottom = bottomHeight
     if target > top {
-      // Hard stop at the top detent (IG / gorhom), no rubber band.
-      target = top
+      // Past the top: gorhom over-drags only from the handle, or when the
+      // body has no scrollable at all (a list takes the gesture instead).
+      let canOverDrag = overDrag && (dragInHandle || dragScrollView == nil)
+      target = canOverDrag ? top + resist(target - top) : top
     } else if target < bottom && !panToDismiss {
-      target = bottom - (bottom - target) * 0.2
+      target = bottom - resist(bottom - target)
     }
     visibleHeight = max(0, target)
     layoutSheet()
@@ -687,6 +934,9 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
         // alone it would now fling from the release velocity.
         killScroll(scrollView)
       }
+      // The user moved the sheet by hand: a later keyboard restore would
+      // fight that, so forget the pre-keyboard detent.
+      indexBeforeKeyboard = nil
       settle(velocityY: velocityY)
     }
     if dragEmittedStart {
@@ -702,7 +952,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     guard !heights.isEmpty else { return }
     // Project the release the way UIKit decelerates, then pick the nearest detent.
     let projected = visibleHeight - velocityY * 0.12
-    let lowest = heights.min() ?? 0
+    let lowest = heights.first ?? 0
     if panToDismiss && (projected < lowest * 0.5 || (velocityY > 1500 && visibleHeight <= lowest + 1)) {
       dismiss(reason: "drag")
       return
@@ -717,6 +967,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       }
     }
     currentIndex = best
+    temporaryTarget = nil
     settleToCurrent(velocity: -velocityY)
   }
 
@@ -726,7 +977,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   /// offset write — UIKit's own tracking included. KVO fires inside the
   /// setter, before the frame is drawn, so a rejected scroll never shows.
   private func refreshContentLock() {
-    guard isPresented, let scrollView = resolveScrollView() else {
+    guard isPresented, contentPanning, let scrollView = resolveScrollView() else {
       lockObservation = nil
       lockedScrollView = nil
       return
@@ -750,7 +1001,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   }
 
   private func enforceContentLock(_ scrollView: UIScrollView) {
-    guard !isLocking, isPresented else { return }
+    guard !isLocking, isPresented, contentPanning else { return }
     // Self-healing: a sheet that is visibly at its top is scrollable whether
     // or not a settle completion managed to flip the flag (and even if our
     // own pan never began for this touch).
@@ -807,6 +1058,11 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     guard let pan = gestureRecognizer as? UIPanGestureRecognizer, pan === sheetPan, let layer = sheetLayer else {
       return true
     }
+    // Which band the touch started in decides whether this sheet is allowed
+    // to take it at all (gorhom's handle / content panning switches).
+    let y = pan.location(in: layer.container).y
+    let inHandle = y < handleArea
+    if inHandle ? !handlePanning : !contentPanning { return false }
     // Vertical intent only: sideways drags belong to carousels inside the
     // body. Accept EITHER velocity or translation dominance — a recognizer
     // that fails stays failed for the whole touch, so a slightly diagonal
@@ -833,6 +1089,18 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     dismiss(reason: "backdrop")
   }
 
+  // MARK: - Accessibility (VoiceOver drives the handle like gorhom's)
+
+  fileprivate func accessibilityStep(_ delta: Int) {
+    guard isPresented else { return }
+    let next = currentIndex + delta
+    if next < 0 {
+      if panToDismiss { dismiss(reason: "programmatic") }
+      return
+    }
+    snapTo(next)
+  }
+
   // MARK: - Keyboard
 
   @objc private func keyboardWillChange(_ notification: Notification) {
@@ -843,22 +1111,35 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     else { return }
     let endFrame = window.convert(endValue.cgRectValue, from: nil)
     let layerBottom = layer.convert(layer.bounds, to: window).maxY - bottomInset
+    // The content's own bottom padding is spent over the keyboard.
     let lift: CGFloat = notification.name == UIResponder.keyboardWillHideNotification
-      ? 0 : max(0, layerBottom - endFrame.minY)
+      ? 0 : max(0, layerBottom - endFrame.minY - contentBottomInset)
     guard abs(lift - keyboardLift) > 0.5 else { return }
     keyboardLift = lift
-    // The keyboard opening takes the sheet to its top detent (IG comments),
-    // in the same animation as the footer lift so nothing moves twice.
-    if lift > 0, expandOnKeyboard, currentIndex != topIndex {
-      currentIndex = topIndex
+    if lift > 0 {
+      // The keyboard opening takes the sheet to its top detent (IG comments),
+      // in the same animation as the footer lift so nothing moves twice.
+      if expandOnKeyboard, currentIndex != topIndex {
+        if indexBeforeKeyboard == nil { indexBeforeKeyboard = currentIndex }
+        currentIndex = topIndex
+        temporaryTarget = nil
+      }
+    } else if restoreOnKeyboardHide, let before = indexBeforeKeyboard {
+      // gorhom's `keyboardBlurBehavior="restore"`.
+      currentIndex = clampIndex(before)
+      temporaryTarget = nil
+      indexBeforeKeyboard = nil
+    } else {
+      indexBeforeKeyboard = nil
     }
     contentUnlocked = false
     emitLayout(phase: 0)
-    let target = resolvedHeight(currentIndex)
+    let target = targetHeight()
     let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
     let curve = (info[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 7
     animationGeneration += 1
     let generation = animationGeneration
+    startDisplayLinkIfNeeded()
     UIView.animate(
       withDuration: duration,
       delay: 0,
@@ -868,18 +1149,27 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       self.layoutSheet()
     } completion: { finished in
       guard generation == self.animationGeneration else { return }
-      if finished { self.contentUnlocked = self.currentIndex == self.topIndex }
+      if finished { self.contentUnlocked = self.atTopTarget() }
       self.emitLayout(phase: 1)
     }
   }
 
   // MARK: - The layer attached to the screen host
 
-  fileprivate final class SheetLayerView: UIView {
+  fileprivate final class GrabberView: UIView {
     weak var owner: NativeBottomSheetContent?
+    override func accessibilityIncrement() { owner?.accessibilityStep(1) }
+    override func accessibilityDecrement() { owner?.accessibilityStep(-1) }
+  }
+
+  fileprivate final class SheetLayerView: UIView {
+    weak var owner: NativeBottomSheetContent? {
+      didSet { grabber.owner = owner }
+    }
     let dimView = UIView()
     let container = UIView()
-    let grabber = UIView()
+    let grabber = GrabberView()
+    let handleSlot = UIView()
     let bodySlot = UIView()
     let footerSlot = UIView()
 
@@ -888,13 +1178,24 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       backgroundColor = .clear
       dimView.backgroundColor = .black
       dimView.alpha = 0
+      dimView.isAccessibilityElement = true
+      dimView.accessibilityLabel = "Bottom sheet backdrop"
+      dimView.accessibilityHint = "Tap to close the bottom sheet"
+      dimView.accessibilityTraits = .button
       addSubview(dimView)
       container.clipsToBounds = true
       container.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
       container.layer.cornerCurve = .continuous
+      container.accessibilityLabel = "Bottom Sheet"
       addSubview(container)
       grabber.layer.cornerRadius = 2.5
+      grabber.isAccessibilityElement = true
+      grabber.accessibilityLabel = "Bottom sheet handle"
+      grabber.accessibilityHint = "Drag up or down to extend or minimize the bottom sheet"
+      grabber.accessibilityTraits = .adjustable
       container.addSubview(grabber)
+      handleSlot.clipsToBounds = true
+      container.addSubview(handleSlot)
       bodySlot.clipsToBounds = true
       container.addSubview(bodySlot)
       footerSlot.clipsToBounds = true

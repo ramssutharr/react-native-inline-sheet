@@ -49,13 +49,17 @@ class NativeBottomSheetViewManager(
         view.onDragEnd = {
             dispatcher()?.dispatchEvent(SheetDragEndEvent(surfaceId(), view.id))
         }
-        view.onLayoutChange = { index, sheetHeight, bodyHeight, maxBodyHeight, footerHeight, keyboardHeight, phase ->
+        view.onLayoutChange = { index, sheetHeight, bodyHeight, maxBodyHeight, footerHeight, keyboardHeight,
+                                hostHeight, dynamic, phase ->
             dispatcher()?.dispatchEvent(
                 SheetLayoutChangeEvent(
                     surfaceId(), view.id, index, sheetHeight, bodyHeight, maxBodyHeight,
-                    footerHeight, keyboardHeight, phase,
+                    footerHeight, keyboardHeight, hostHeight, dynamic, phase,
                 ),
             )
+        }
+        view.onPositionChange = { position, index, height ->
+            dispatcher()?.dispatchEvent(SheetPositionChangeEvent(surfaceId(), view.id, position, index, height))
         }
     }
 
@@ -65,8 +69,8 @@ class NativeBottomSheetViewManager(
         delegate.receiveCommand(root, commandId, args)
     }
 
-    override fun present(view: NativeBottomSheetHostView, index: Int) {
-        view.present(index)
+    override fun present(view: NativeBottomSheetHostView, index: Int, animated: Boolean) {
+        view.present(index, animated)
     }
 
     override fun dismiss(view: NativeBottomSheetHostView) {
@@ -75,6 +79,10 @@ class NativeBottomSheetViewManager(
 
     override fun snapTo(view: NativeBottomSheetHostView, index: Int) {
         view.snapTo(index)
+    }
+
+    override fun snapToHeight(view: NativeBottomSheetHostView, spec: String?) {
+        view.snapToHeight(spec ?: "")
     }
 
     /**
@@ -98,6 +106,7 @@ class NativeBottomSheetViewManager(
             SheetDragStartEvent.NAME to mapOf("registrationName" to "onDragStart"),
             SheetDragEndEvent.NAME to mapOf("registrationName" to "onDragEnd"),
             SheetLayoutChangeEvent.NAME to mapOf("registrationName" to "onLayoutChange"),
+            SheetPositionChangeEvent.NAME to mapOf("registrationName" to "onPositionChange"),
         )
 
     // MARK: - Props
@@ -120,6 +129,56 @@ class NativeBottomSheetViewManager(
     @ReactProp(name = "bottomInset")
     override fun setBottomInset(view: NativeBottomSheetHostView, value: Float) {
         view.setBottomInsetDp(value)
+    }
+
+    @ReactProp(name = "maxAutoHeight")
+    override fun setMaxAutoHeight(view: NativeBottomSheetHostView, value: Float) {
+        view.setMaxAutoHeightDp(value)
+    }
+
+    @ReactProp(name = "contentBottomInset")
+    override fun setContentBottomInset(view: NativeBottomSheetHostView, value: Float) {
+        view.setContentBottomInsetDp(value)
+    }
+
+    @ReactProp(name = "enableContentPanningGesture")
+    override fun setEnableContentPanningGesture(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setEnableContentPanningGesture(value)
+    }
+
+    @ReactProp(name = "enableHandlePanningGesture")
+    override fun setEnableHandlePanningGesture(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setEnableHandlePanningGesture(value)
+    }
+
+    @ReactProp(name = "enableOverDrag")
+    override fun setEnableOverDrag(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setEnableOverDrag(value)
+    }
+
+    @ReactProp(name = "overDragResistanceFactor")
+    override fun setOverDragResistanceFactor(view: NativeBottomSheetHostView, value: Float) {
+        view.setOverDragResistanceFactor(value)
+    }
+
+    @ReactProp(name = "restoreDetentOnKeyboardHide")
+    override fun setRestoreDetentOnKeyboardHide(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setRestoreDetentOnKeyboardHide(value)
+    }
+
+    @ReactProp(name = "detached")
+    override fun setDetached(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setDetached(value)
+    }
+
+    @ReactProp(name = "detachedMargin")
+    override fun setDetachedMargin(view: NativeBottomSheetHostView, value: Float) {
+        view.setDetachedMarginDp(value)
+    }
+
+    @ReactProp(name = "positionEventsEnabled")
+    override fun setPositionEventsEnabled(view: NativeBottomSheetHostView, value: Boolean) {
+        view.setPositionEventsEnabled(value)
     }
 
     @ReactProp(name = "dimColor", customType = "Color")
@@ -184,7 +243,7 @@ class NativeBottomSheetViewManager(
 
     @ReactProp(name = "keyboardMode")
     override fun setKeyboardMode(view: NativeBottomSheetHostView, value: String?) {
-        view.setKeyboardMode(value ?: "lift-footer")
+        view.setKeyboardMode(value ?: "lift-sheet")
     }
 
     @ReactProp(name = "expandOnKeyboard")

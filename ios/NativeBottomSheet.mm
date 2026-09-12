@@ -17,6 +17,8 @@
 - (void)setInitialDetent:(NSInteger)index;
 - (void)setMaxDetentInset:(CGFloat)inset;
 - (void)setBottomInset:(CGFloat)inset;
+- (void)setMaxAutoHeight:(CGFloat)value;
+- (void)setContentBottomInset:(CGFloat)value;
 - (void)setDimColor:(UIColor *_Nullable)color;
 - (void)setGrabberWidth:(CGFloat)value;
 - (void)setGrabberHeight:(CGFloat)value;
@@ -29,15 +31,24 @@
 - (void)setGrabberColor:(UIColor *_Nullable)color;
 - (void)setEnablePanToDismiss:(BOOL)value;
 - (void)setDismissOnBackdropPress:(BOOL)value;
+- (void)setEnableContentPanningGesture:(BOOL)value;
+- (void)setEnableHandlePanningGesture:(BOOL)value;
+- (void)setEnableOverDrag:(BOOL)value;
+- (void)setOverDragResistanceFactor:(CGFloat)value;
+- (void)setRestoreDetentOnKeyboardHide:(BOOL)value;
+- (void)setDetached:(BOOL)value;
+- (void)setDetachedMargin:(CGFloat)value;
+- (void)setPositionEventsEnabled:(BOOL)value;
 - (void)setKeyboardMode:(NSString *)value;
 - (void)setExpandOnKeyboard:(BOOL)value;
 - (void)setDismissKeyboardOnDrag:(BOOL)value;
 - (void)setHostStrategy:(NSString *)value;
 - (void)mountChild:(UIView *)child nativeId:(NSString *_Nullable)nativeId;
 - (void)unmountChild:(UIView *)child;
-- (void)present:(NSInteger)index;
+- (void)present:(NSInteger)index animated:(BOOL)animated;
 - (void)dismiss;
 - (void)snapTo:(NSInteger)index;
+- (void)snapToHeight:(NSString *)spec;
 - (void)reset;
 @property (nonatomic, copy, nullable) void (^onPresent)(void);
 @property (nonatomic, copy, nullable) void (^onDismiss)(NSString *reason);
@@ -45,7 +56,8 @@
 @property (nonatomic, copy, nullable) void (^onDragEnd)(void);
 @property (nonatomic, copy, nullable) void (^onLayoutChange)
     (NSInteger index, CGFloat sheetHeight, CGFloat bodyHeight, CGFloat maxBodyHeight, CGFloat footerHeight,
-     CGFloat keyboardHeight, NSInteger phase);
+     CGFloat keyboardHeight, CGFloat hostHeight, NSInteger dynamic, NSInteger phase);
+@property (nonatomic, copy, nullable) void (^onPositionChange)(CGFloat position, CGFloat index, CGFloat height);
 @property (nonatomic, copy, nullable) void (^cancelReactTouches)(void);
 @property (nonatomic, copy, nullable) UIScrollView *_Nullable (^scrollViewResolver)(UIView *bodyRoot);
 @end
@@ -94,14 +106,20 @@ using namespace facebook::react;
       [weakSelf emitDragEnd];
     };
     _content.onLayoutChange = ^(NSInteger index, CGFloat sheetHeight, CGFloat bodyHeight, CGFloat maxBodyHeight,
-                                CGFloat footerHeight, CGFloat keyboardHeight, NSInteger phase) {
+                                CGFloat footerHeight, CGFloat keyboardHeight, CGFloat hostHeight, NSInteger dynamic,
+                                NSInteger phase) {
       [weakSelf emitLayoutChange:index
                      sheetHeight:sheetHeight
                       bodyHeight:bodyHeight
                    maxBodyHeight:maxBodyHeight
                     footerHeight:footerHeight
                   keyboardHeight:keyboardHeight
+                      hostHeight:hostHeight
+                         dynamic:dynamic
                            phase:phase];
+    };
+    _content.onPositionChange = ^(CGFloat position, CGFloat index, CGFloat height) {
+      [weakSelf emitPositionChange:position index:index height:height];
     };
   }
   return self;
@@ -217,6 +235,8 @@ using namespace facebook::react;
            maxBodyHeight:(CGFloat)maxBodyHeight
             footerHeight:(CGFloat)footerHeight
           keyboardHeight:(CGFloat)keyboardHeight
+              hostHeight:(CGFloat)hostHeight
+                 dynamic:(NSInteger)dynamic
                    phase:(NSInteger)phase
 {
   if (_eventEmitter == nullptr) {
@@ -230,7 +250,22 @@ using namespace facebook::react;
       .maxBodyHeight = static_cast<Float>(maxBodyHeight),
       .footerHeight = static_cast<Float>(footerHeight),
       .keyboardHeight = static_cast<Float>(keyboardHeight),
+      .hostHeight = static_cast<Float>(hostHeight),
+      .dynamic = static_cast<int>(dynamic),
       .phase = static_cast<int>(phase),
+  });
+}
+
+- (void)emitPositionChange:(CGFloat)position index:(CGFloat)index height:(CGFloat)height
+{
+  if (_eventEmitter == nullptr) {
+    return;
+  }
+  auto emitter = std::static_pointer_cast<const NativeBottomSheetEventEmitter>(_eventEmitter);
+  emitter->onPositionChange({
+      .position = static_cast<Float>(position),
+      .index = static_cast<Float>(index),
+      .height = static_cast<Float>(height),
   });
 }
 
@@ -241,9 +276,9 @@ using namespace facebook::react;
   RCTNativeBottomSheetHandleCommand(self, commandName, args);
 }
 
-- (void)present:(NSInteger)index
+- (void)present:(NSInteger)index animated:(BOOL)animated
 {
-  [_content present:index];
+  [_content present:index animated:animated];
 }
 
 - (void)dismiss
@@ -254,6 +289,11 @@ using namespace facebook::react;
 - (void)snapTo:(NSInteger)index
 {
   [_content snapTo:index];
+}
+
+- (void)snapToHeight:(NSString *)spec
+{
+  [_content snapToHeight:spec ?: @""];
 }
 
 #pragma mark - Props
@@ -278,6 +318,36 @@ using namespace facebook::react;
   }
   if (oldProps == nullptr || newProps.bottomInset != previousProps.bottomInset) {
     [_content setBottomInset:newProps.bottomInset];
+  }
+  if (oldProps == nullptr || newProps.maxAutoHeight != previousProps.maxAutoHeight) {
+    [_content setMaxAutoHeight:newProps.maxAutoHeight];
+  }
+  if (oldProps == nullptr || newProps.contentBottomInset != previousProps.contentBottomInset) {
+    [_content setContentBottomInset:newProps.contentBottomInset];
+  }
+  if (oldProps == nullptr || newProps.enableContentPanningGesture != previousProps.enableContentPanningGesture) {
+    [_content setEnableContentPanningGesture:newProps.enableContentPanningGesture];
+  }
+  if (oldProps == nullptr || newProps.enableHandlePanningGesture != previousProps.enableHandlePanningGesture) {
+    [_content setEnableHandlePanningGesture:newProps.enableHandlePanningGesture];
+  }
+  if (oldProps == nullptr || newProps.enableOverDrag != previousProps.enableOverDrag) {
+    [_content setEnableOverDrag:newProps.enableOverDrag];
+  }
+  if (oldProps == nullptr || newProps.overDragResistanceFactor != previousProps.overDragResistanceFactor) {
+    [_content setOverDragResistanceFactor:newProps.overDragResistanceFactor];
+  }
+  if (oldProps == nullptr || newProps.restoreDetentOnKeyboardHide != previousProps.restoreDetentOnKeyboardHide) {
+    [_content setRestoreDetentOnKeyboardHide:newProps.restoreDetentOnKeyboardHide];
+  }
+  if (oldProps == nullptr || newProps.detached != previousProps.detached) {
+    [_content setDetached:newProps.detached];
+  }
+  if (oldProps == nullptr || newProps.detachedMargin != previousProps.detachedMargin) {
+    [_content setDetachedMargin:newProps.detachedMargin];
+  }
+  if (oldProps == nullptr || newProps.positionEventsEnabled != previousProps.positionEventsEnabled) {
+    [_content setPositionEventsEnabled:newProps.positionEventsEnabled];
   }
   if (oldProps == nullptr || newProps.dimColor != previousProps.dimColor) {
     [_content setDimColor:RCTUIColorFromSharedColor(newProps.dimColor)];
@@ -313,7 +383,7 @@ using namespace facebook::react;
     [_content setDismissOnBackdropPress:newProps.dismissOnBackdropPress];
   }
   if (oldProps == nullptr || newProps.keyboardMode != previousProps.keyboardMode) {
-    [_content setKeyboardMode:[NSString stringWithUTF8String:newProps.keyboardMode.c_str()] ?: @"lift-footer"];
+    [_content setKeyboardMode:[NSString stringWithUTF8String:newProps.keyboardMode.c_str()] ?: @"lift-sheet"];
   }
   if (oldProps == nullptr || newProps.expandOnKeyboard != previousProps.expandOnKeyboard) {
     [_content setExpandOnKeyboard:newProps.expandOnKeyboard];

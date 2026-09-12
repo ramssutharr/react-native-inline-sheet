@@ -57,6 +57,8 @@ class SheetLayoutChangeEvent(
     private val maxBodyHeight: Float,
     private val footerHeight: Float,
     private val keyboardHeight: Float,
+    private val hostHeight: Float,
+    private val dynamic: Int,
     private val phase: Int,
 ) : Event<SheetLayoutChangeEvent>(surfaceId, viewTag) {
     override fun getEventName(): String = NAME
@@ -67,8 +69,32 @@ class SheetLayoutChangeEvent(
         putDouble("maxBodyHeight", maxBodyHeight.toDouble())
         putDouble("footerHeight", footerHeight.toDouble())
         putDouble("keyboardHeight", keyboardHeight.toDouble())
+        putDouble("hostHeight", hostHeight.toDouble())
+        putInt("dynamic", dynamic)
         putInt("phase", phase)
     }
 
     companion object { const val NAME = "topLayoutChange" }
+}
+
+/**
+ * The sheet's live position (dp) — per frame while it moves, only while
+ * `positionEventsEnabled`. Coalesced: only the latest frame matters.
+ */
+class SheetPositionChangeEvent(
+    surfaceId: Int,
+    viewTag: Int,
+    private val position: Float,
+    private val index: Float,
+    private val height: Float,
+) : Event<SheetPositionChangeEvent>(surfaceId, viewTag) {
+    override fun getEventName(): String = NAME
+    override fun canCoalesce(): Boolean = true
+    override fun getEventData(): WritableMap = Arguments.createMap().apply {
+        putDouble("position", position.toDouble())
+        putDouble("index", index.toDouble())
+        putDouble("height", height.toDouble())
+    }
+
+    companion object { const val NAME = "topPositionChange" }
 }

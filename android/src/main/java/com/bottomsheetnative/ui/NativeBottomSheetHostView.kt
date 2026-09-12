@@ -17,8 +17,10 @@ class NativeBottomSheetHostView(context: Context) : ViewGroup(context) {
     var onDismiss: ((String) -> Unit)? = null
     var onDragStart: (() -> Unit)? = null
     var onDragEnd: (() -> Unit)? = null
-    /** (index, sheetHeight, bodyHeight (-1 = auto), maxBodyHeight (-1 = all auto), footerHeight, keyboardHeight, phase) — dp. */
-    var onLayoutChange: ((Int, Float, Float, Float, Float, Float, Int) -> Unit)? = null
+    /** (index, sheetHeight, bodyHeight (-1 = auto), maxBodyHeight (-1 = all auto), footerHeight, keyboardHeight, hostHeight, dynamic, phase) — dp. */
+    var onLayoutChange: ((Int, Float, Float, Float, Float, Float, Float, Int, Int) -> Unit)? = null
+    /** (position, fractional index, visible height) — dp, per frame while armed. */
+    var onPositionChange: ((Float, Float, Float) -> Unit)? = null
 
     private val reactChildren = ArrayList<View>()
     internal val sheet = SheetLayerView(context, this)
@@ -45,6 +47,8 @@ class NativeBottomSheetHostView(context: Context) : ViewGroup(context) {
     fun setInitialDetent(index: Int) = sheet.setInitialDetent(index)
     fun setMaxDetentInsetDp(value: Float) = sheet.setMaxDetentInsetDp(value)
     fun setBottomInsetDp(value: Float) = sheet.setBottomInsetDp(value)
+    fun setMaxAutoHeightDp(value: Float) = sheet.setMaxAutoHeightDp(value)
+    fun setContentBottomInsetDp(value: Float) = sheet.setContentBottomInsetDp(value)
     fun setDimColor(color: Int?) = sheet.setDimColor(color)
     fun setGrabberWidthDp(value: Float) = sheet.setGrabberWidthDp(value)
     fun setGrabberHeightDp(value: Float) = sheet.setGrabberHeightDp(value)
@@ -57,6 +61,14 @@ class NativeBottomSheetHostView(context: Context) : ViewGroup(context) {
     fun setGrabberColor(color: Int?) = sheet.setGrabberColor(color)
     fun setEnablePanToDismiss(value: Boolean) = sheet.setEnablePanToDismiss(value)
     fun setDismissOnBackdropPress(value: Boolean) = sheet.setDismissOnBackdropPress(value)
+    fun setEnableContentPanningGesture(value: Boolean) = sheet.setEnableContentPanningGesture(value)
+    fun setEnableHandlePanningGesture(value: Boolean) = sheet.setEnableHandlePanningGesture(value)
+    fun setEnableOverDrag(value: Boolean) = sheet.setEnableOverDrag(value)
+    fun setOverDragResistanceFactor(value: Float) = sheet.setOverDragResistanceFactor(value)
+    fun setRestoreDetentOnKeyboardHide(value: Boolean) = sheet.setRestoreDetentOnKeyboardHide(value)
+    fun setDetached(value: Boolean) = sheet.setDetached(value)
+    fun setDetachedMarginDp(value: Float) = sheet.setDetachedMarginDp(value)
+    fun setPositionEventsEnabled(value: Boolean) = sheet.setPositionEventsEnabled(value)
     fun setKeyboardMode(value: String) = sheet.setKeyboardMode(value)
     fun setExpandOnKeyboard(value: Boolean) = sheet.setExpandOnKeyboard(value)
     fun setDismissKeyboardOnDrag(value: Boolean) = sheet.setDismissKeyboardOnDrag(value)
@@ -66,9 +78,10 @@ class NativeBottomSheetHostView(context: Context) : ViewGroup(context) {
 
     // MARK: - Commands
 
-    fun present(index: Int) = sheet.present(index)
+    fun present(index: Int, animated: Boolean) = sheet.present(index, animated)
     fun dismiss() = sheet.dismiss("programmatic")
     fun snapTo(index: Int) = sheet.snapTo(index)
+    fun snapToHeight(spec: String) = sheet.snapToHeight(spec)
 
     /** Fabric dropped the view: tear the sheet down synchronously. */
     fun onDropped() = sheet.destroy()

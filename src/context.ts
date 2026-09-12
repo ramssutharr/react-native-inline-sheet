@@ -1,4 +1,5 @@
-import { createContext, useContext } from 'react';
+import { createContext, useContext, useEffect } from 'react';
+import type { SharedValueLike } from './animated';
 
 export type BottomSheetNativeLayout = {
   /** Settled detent index (-1 while dismissed). */
@@ -22,15 +23,33 @@ export type BottomSheetNativeLayout = {
   bottomInset: number;
   footerHeight: number;
   keyboardHeight: number;
+  /** The host layer's height; `hostHeight - sheetHeight` is gorhom's settled "position". */
+  hostHeight: number;
   isPresented: boolean;
 };
 
 export type BottomSheetNativeActions = {
   snapToIndex: (index: number) => void;
+  /** gorhom's `snapToPosition`: a dp number or a `'50%'` string. */
+  snapToPosition: (position: number | string) => void;
   expand: () => void;
   collapse: () => void;
   close: () => void;
+  forceClose: () => void;
   dismiss: () => void;
+};
+
+/**
+ * gorhom's `animatedIndex` / `animatedPosition`. With Reanimated installed
+ * these are real shared values written on the UI thread per frame while the
+ * sheet moves; without it they are plain `{ value }` objects updated when
+ * the sheet settles.
+ */
+export type BottomSheetNativeAnimated = {
+  animatedIndex: SharedValueLike<number>;
+  animatedPosition: SharedValueLike<number>;
+  /** Arms the per-frame native event while a consumer is mounted. */
+  subscribe: () => () => void;
 };
 
 export const BottomSheetNativeLayoutContext = createContext<BottomSheetNativeLayout>({
@@ -41,15 +60,24 @@ export const BottomSheetNativeLayoutContext = createContext<BottomSheetNativeLay
   bottomInset: 0,
   footerHeight: 0,
   keyboardHeight: 0,
+  hostHeight: 0,
   isPresented: false,
 });
 
 export const BottomSheetNativeActionsContext = createContext<BottomSheetNativeActions>({
   snapToIndex: () => {},
+  snapToPosition: () => {},
   expand: () => {},
   collapse: () => {},
   close: () => {},
+  forceClose: () => {},
   dismiss: () => {},
+});
+
+export const BottomSheetNativeAnimatedContext = createContext<BottomSheetNativeAnimated>({
+  animatedIndex: { value: -1 },
+  animatedPosition: { value: 0 },
+  subscribe: () => () => {},
 });
 
 /**
@@ -60,6 +88,30 @@ export const BottomSheetNativeActionsContext = createContext<BottomSheetNativeAc
 export const useBottomSheetNativeLayout = (): BottomSheetNativeLayout =>
   useContext(BottomSheetNativeLayoutContext);
 
-/** Imperative controls from inside the sheet's content (the gorhom `useBottomSheet()` shape). */
+/** Imperative controls from inside the sheet's content. */
 export const useBottomSheetNativeActions = (): BottomSheetNativeActions =>
   useContext(BottomSheetNativeActionsContext);
+
+/**
+ * The sheet's live position as shared values, from inside its content.
+ * Mounting a consumer arms the per-frame native event; nothing is emitted
+ * for sheets that nobody tracks.
+ */
+export const useBottomSheetAnimated = (): {
+  animatedIndex: SharedValueLike<number>;
+  animatedPosition: SharedValueLike<number>;
+} => {
+  const { animatedIndex, animatedPosition, subscribe } = useContext(BottomSheetNativeAnimatedContext);
+  useEffect(() => subscribe(), [subscribe]);
+  return { animatedIndex, animatedPosition };
+};
+
+/** gorhom's `useBottomSheet()`: the methods plus `animatedIndex` / `animatedPosition`. */
+export const useBottomSheet = (): BottomSheetNativeActions & {
+  animatedIndex: SharedValueLike<number>;
+  animatedPosition: SharedValueLike<number>;
+} => {
+  const actions = useBottomSheetNativeActions();
+  const animated = useBottomSheetAnimated();
+  return { ...actions, ...animated };
+};
