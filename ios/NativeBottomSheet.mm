@@ -1,4 +1,5 @@
 #import "NativeBottomSheet.h"
+#import "NativeBottomSheetSlot.h"
 
 #import <react/renderer/components/RNBottomSheetNativeSpec/ComponentDescriptors.h>
 #import <react/renderer/components/RNBottomSheetNativeSpec/EventEmitters.h>
@@ -59,6 +60,7 @@
      CGFloat keyboardHeight, CGFloat hostHeight, NSInteger dynamic, NSInteger phase);
 @property (nonatomic, copy, nullable) void (^onPositionChange)(CGFloat position, CGFloat index, CGFloat height);
 @property (nonatomic, copy, nullable) void (^cancelReactTouches)(void);
+@property (nonatomic, copy, nullable) void (^onSlotsMoved)(void);
 @property (nonatomic, copy, nullable) UIScrollView *_Nullable (^scrollViewResolver)(UIView *bodyRoot);
 @end
 
@@ -69,6 +71,8 @@ using namespace facebook::react;
 
 @implementation NativeBottomSheet {
   NativeBottomSheetContent *_content;
+  /// Mounted slots, re-synced whenever the sheet lays them out.
+  NSHashTable<NativeBottomSheetSlot *> *_slots;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -92,6 +96,10 @@ using namespace facebook::react;
     };
     _content.cancelReactTouches = ^{
       [weakSelf cancelReactTouches];
+    };
+    _slots = [NSHashTable weakObjectsHashTable];
+    _content.onSlotsMoved = ^{
+      [weakSelf syncSlots];
     };
     _content.onPresent = ^{
       [weakSelf emitPresent];
@@ -184,11 +192,30 @@ using namespace facebook::react;
     nativeId = [(id)childComponentView nativeId];
   }
   [_content mountChild:childComponentView nativeId:nativeId];
+  if ([childComponentView isKindOfClass:[NativeBottomSheetSlot class]]) {
+    [_slots addObject:(NativeBottomSheetSlot *)childComponentView];
+    [(NativeBottomSheetSlot *)childComponentView syncContentOriginWithHost:self];
+  }
 }
 
 - (void)unmountChildComponentView:(UIView<RCTComponentViewProtocol> *)childComponentView index:(NSInteger)index
 {
+  [_slots removeObject:(id)childComponentView];
   [_content unmountChild:childComponentView];
+}
+
+#pragma mark - Measured position
+
+/// `Pressable` decides whether a moving finger is still on it from
+/// `measure()`, which reads the shadow tree — and the shadow tree places every
+/// slot at this hidden host, not in the sheet. Any press that emits a
+/// touch-move (a rolling finger, or just pressing harder on a 3D Touch
+/// iPhone) was dropped. Each slot reports its real displacement instead.
+- (void)syncSlots
+{
+  for (NativeBottomSheetSlot *slot in _slots) {
+    [slot syncContentOriginWithHost:self];
+  }
 }
 
 #pragma mark - Events

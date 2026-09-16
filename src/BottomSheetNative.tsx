@@ -18,6 +18,15 @@ import {
   type ViewStyle,
 } from 'react-native';
 import NativeBottomSheetView, { Commands } from './NativeBottomSheetNativeComponent';
+
+/**
+ * Slot container. iOS needs a slot that keeps `measure()` truthful once the
+ * native sheet moves it (see `NativeBottomSheetSlotNativeComponent`); Android
+ * keeps plain Views. Required lazily so Android never resolves the iOS-only
+ * component.
+ */
+const SlotView: React.ComponentType<React.ComponentProps<typeof View>> =
+  Platform.OS === 'ios' ? require('./NativeBottomSheetSlotNativeComponent').default : View;
 import { getReanimated, resolveHost, type SharedValueLike } from './animated';
 import {
   BottomSheetNativeActionsContext,
@@ -809,7 +818,7 @@ function BottomSheetNativeInner<T = any>(
           <BottomSheetNativeActionsContext.Provider value={actions}>
             <BottomSheetNativeAnimatedContext.Provider value={animatedValue}>
               {CustomHandle != null ? (
-                <View
+                <SlotView
                   nativeID={SHEET_HANDLE_ID}
                   collapsable={false}
                   style={[styles.child, { width: windowWidth - 2 * (detached ? detachedMargin : 0) }]}
@@ -818,9 +827,9 @@ function BottomSheetNativeInner<T = any>(
                     animatedIndex={animatedValue.animatedIndex}
                     animatedPosition={animatedValue.animatedPosition}
                   />
-                </View>
+                </SlotView>
               ) : null}
-              <View
+              <SlotView
                 nativeID={SHEET_BODY_ID}
                 collapsable={false}
                 style={[
@@ -835,15 +844,15 @@ function BottomSheetNativeInner<T = any>(
                 ]}
               >
                 {bodyContent}
-              </View>
+              </SlotView>
               {footerContent != null ? (
-                <View
+                <SlotView
                   nativeID={SHEET_FOOTER_ID}
                   collapsable={false}
                   style={[styles.child, { width: windowWidth - 2 * (detached ? detachedMargin : 0) }, footerStyle]}
                 >
                   {footerContent}
-                </View>
+                </SlotView>
               ) : null}
             </BottomSheetNativeAnimatedContext.Provider>
           </BottomSheetNativeActionsContext.Provider>

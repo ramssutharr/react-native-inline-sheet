@@ -10,6 +10,7 @@
     "src",
     "android",
     "ios",
+    "cpp",
     "*.podspec",
     "README.md",
     "LICENSE",
@@ -68,7 +69,8 @@
     },
     "ios": {
       "componentProvider": {
-        "NativeBottomSheet": "NativeBottomSheet"
+        "NativeBottomSheet": "NativeBottomSheet",
+        "NativeBottomSheetSlot": "NativeBottomSheetSlot"
       }
     }
   }

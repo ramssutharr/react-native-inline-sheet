@@ -45,6 +45,11 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   /// Provided by the host: cancels React's in-flight JS touches so a press
   /// under the finger never fires once the sheet owns the drag.
   @objc public var cancelReactTouches: (() -> Void)?
+  /// The slots were laid out, or a touch is about to land in them. The host
+  /// re-reports where its React children really are on screen: Fabric's
+  /// `measure()` only knows the position JS laid them out at (the hidden
+  /// host), and `Pressable` compares every touch-move against that rect.
+  @objc public var onSlotsMoved: (() -> Void)?
   /// Given the mounted body root, returns its main vertical RN scroll view.
   /// RN-specific, so it lives on the ObjC++ side; a plain-UIKit fallback
   /// walks the subtree here.
@@ -152,6 +157,13 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   /// from `visibleHeight`: inside a UIView spring the model value is already
   /// the target, which would free the list while the sheet is still rising.
   private var contentUnlocked = false
+
+  /// How far the finger travels before a drag counts as one rather than a tap
+  /// that drifted. UIKit recognises a pan at about ten points, which an
+  /// ordinary tap passes on a hand-held phone, and the press under the finger
+  /// is cancelled when it does. Android's side gates on `scaledTouchSlop`
+  /// already; this is the iOS equivalent.
+  private static let dragSlop: CGFloat = 16
 
   private static let overshoot: CGFloat = 240
 
@@ -558,7 +570,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private func makeLayer() -> SheetLayerView {
     let layer = SheetLayerView()
     layer.owner = self
-    let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+    let pan = SlopPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+    pan.slop = Self.dragSlop
     pan.delegate = self
     // Coexist with RN's surface touch handler — never cancel view touch
     // delivery ourselves; JS touches are cancelled explicitly when the sheet
@@ -636,6 +649,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     let footerTop = max(0, anchor - footerKeyboardLift() - footerHeight)
     layer.footerSlot.frame = CGRect(x: 0, y: footerTop, width: cw, height: footerHeight)
     layer.bodySlot.frame = CGRect(x: 0, y: area, width: cw, height: max(0, footerTop - area))
+    onSlotsMoved?()
     emitPosition()
   }
 
@@ -1224,7 +1238,41 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       if hit === self || hit === dimView {
         return (owner?.blocksBackdropTouches ?? false) ? dimView : nil
       }
+      // A touch is landing on React content. Whatever moved the sheet since
+      // the last layout (the host's own screen, a settle), the offsets must be
+      // current before JS measures the press.
+      if hit != nil { owner?.onSlotsMoved?() }
       return hit
     }
+  }
+}
+
+/// A pan that stays `.possible` until the finger has really travelled. UIKit
+/// recognises a pan after about ten points, and an ordinary tap drifts past
+/// that on a hand-held phone — once the pan wins, the press under the finger
+/// is cancelled and the tap is simply lost, with the sheet springing back to
+/// where it was so nothing on screen explains the miss. Withholding the moved
+/// touches keeps the recognizer out of the arbitration until the movement is
+/// unambiguously a drag.
+private final class SlopPanGestureRecognizer: UIPanGestureRecognizer {
+  var slop: CGFloat = 16
+  private var origin: CGPoint?
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    origin = touches.first?.location(in: view)
+    super.touchesBegan(touches, with: event)
+  }
+
+  override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+    if state == .possible, let origin, let point = touches.first?.location(in: view),
+       abs(point.y - origin.y) < slop, abs(point.x - origin.x) < slop {
+      return
+    }
+    super.touchesMoved(touches, with: event)
+  }
+
+  override func reset() {
+    origin = nil
+    super.reset()
   }
 }

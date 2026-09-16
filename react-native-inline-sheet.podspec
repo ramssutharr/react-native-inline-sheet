@@ -13,17 +13,19 @@ Pod::Spec.new do |s|
   s.platforms    = { :ios => "15.1" }
   s.source       = { :git => package["repository"]["url"], :tag => "v#{s.version}" }
 
-  s.source_files = "ios/**/*.{h,m,mm,swift}"
+  # `cpp/` is the iOS slot's shadow node (Fabric C++), compiled with the pod.
+  s.source_files = "ios/**/*.{h,m,mm,swift}", "cpp/**/*.{h,cpp}"
   # The ObjC++ view header imports C++ Fabric headers; it must stay out of
   # the pod's umbrella header or clang cannot build the module (the host app
   # links pods as static frameworks). Nothing needs to import it: the .mm
   # forward-declares the Swift class, and the Swift file is pure UIKit.
-  s.private_header_files = "ios/**/*.h"
+  s.private_header_files = "ios/**/*.h", "cpp/**/*.h"
   s.swift_version = "5.0"
 
   s.pod_target_xcconfig = {
     "DEFINES_MODULE" => "YES",
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
+    "HEADER_SEARCH_PATHS" => "\"$(PODS_TARGET_SRCROOT)/cpp\"",
   }
 
   # Fabric / codegen wiring for the host app (React-Core, RCT-Folly, codegen
