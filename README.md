@@ -141,6 +141,10 @@ keyboard natively.
   system's Reduce Motion / animator-scale settings shorten the springs.
 - `SheetRouter` for multi-step content inside one sheet (push/pop with a slide;
   an `auto` detent follows each route's height).
+- `Pressable`s keep working wherever the sheet has moved them. On iOS each slot
+  reports its real on-screen position to Fabric, so `measure()` agrees with
+  what is drawn and a press that emits touch-moves (a rolling finger, 3D Touch
+  pressure) still fires.
 
 ## Gesture model (gorhom's)
 
@@ -152,5 +156,6 @@ hands the gesture to the sheet. The top detent is a hard stop.
 
 ## Install
 
-Autolinked. iOS: `pod install` (also after any change to the codegen spec).
+Autolinked. iOS: `pod install` (also after any change to the codegen spec, and
+after upgrading to 0.3.0, which adds the `NativeBottomSheetSlot` component).
 Ships untranspiled TypeScript — allow it through Jest's `transformIgnorePatterns`.
