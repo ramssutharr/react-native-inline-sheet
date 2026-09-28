@@ -115,6 +115,11 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
   private var temporaryTarget: CGFloat?
   private var visibleHeight: CGFloat = 0
   private var keyboardLift: CGFloat = 0
+  /// The keyboard's top edge in the layer (nil while it is off screen).
+  private var keyboardTop: CGFloat?
+  /// A pan owns the height from `.began` to release: a keyboard hiding
+  /// mid-drag must not animate the sheet to a detent under the finger.
+  private var panInFlight = false
   /// Where the sheet sat before the keyboard expanded it (for the restore).
   private var indexBeforeKeyboard: Int?
   /// Bumped on every new animation so a superseded completion is ignored.
@@ -305,19 +310,21 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       bodyObservation = nil
       bodyChild = nil
       bodyAutoHeight = 0
+      // The lock rode on THIS body's list; a later body gets its own.
+      lockObservation = nil
+      lockedScrollView = nil
     }
     if footerChild === child {
       footerObservation = nil
       footerChild = nil
-      footerHeight = 0
-      layoutSheet()
+      // Same path as a footer shrinking to nothing: an `auto` detent
+      // re-settles without it and JS gets the new geometry.
+      footerHeightChanged(0)
     }
     if handleChild === child {
       handleObservation = nil
       handleChild = nil
-      handleHeight = 0
-      layoutSheet()
-      if isPresented { emitLayout(phase: 1) }
+      handleHeightChanged(0)
     }
     child.removeFromSuperview()
   }
@@ -338,6 +345,9 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     refreshContentLock()
     guard abs(height - bodyAutoHeight) > 0.5 else { return }
     bodyAutoHeight = height
+    // The auto height feeds the dim progress and the footer anchor even
+    // while the sheet rests at a fixed detent.
+    layoutSheet()
     guard isPresented, isAuto(currentIndex) else { return }
     settleToCurrent(velocity: 0)
   }
@@ -471,6 +481,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     handleHeight = 0
     visibleHeight = 0
     keyboardLift = 0
+    keyboardTop = nil
+    panInFlight = false
     currentIndex = 0
     temporaryTarget = nil
     indexBeforeKeyboard = nil
@@ -486,6 +498,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     lockedScrollView = nil
     dragOwner = .undecided
     dragScrollView = nil
+    panInFlight = false
     temporaryTarget = nil
     indexBeforeKeyboard = nil
     if dragEmittedStart {
@@ -817,6 +830,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     switch pan.state {
     case .began:
       freezeAtPresentation()
+      panInFlight = true
       dragOwner = .undecided
       dragStartHeight = visibleHeight
       lastTranslationY = 0
@@ -864,6 +878,10 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
           layoutSheet()
           contentUnlocked = true
           dragOwner = .content
+          // The sheet is at the top for good: no settle follows (the list
+          // owns the rest of the gesture), so report the detent now, or the
+          // body keeps the last one's sizes.
+          emitLayout(phase: 1)
         }
       case .content:
         // The list scrolled back to its top while the finger is still down
@@ -880,6 +898,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
         break
       }
     case .ended, .cancelled, .failed:
+      panInFlight = false
       finishDrag(velocityY: pan.velocity(in: layer).y)
     default:
       break
@@ -1131,11 +1150,14 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
           let endValue = info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue
     else { return }
     let endFrame = window.convert(endValue.cgRectValue, from: nil)
-    let layerBottom = layer.convert(layer.bounds, to: window).maxY - bottomInset
-    // The content's own bottom padding is spent over the keyboard.
-    let lift: CGFloat = notification.name == UIResponder.keyboardWillHideNotification
-      ? 0 : max(0, layerBottom - endFrame.minY - contentBottomInset)
-    guard abs(lift - keyboardLift) > 0.5 else { return }
+    let top = layer.convert(endFrame, from: window).minY
+    keyboardTop = notification.name == UIResponder.keyboardWillHideNotification || top >= layer.bounds.height - 1
+      ? nil : top
+    let lift = liftForKeyboard()
+    // No early return when the lift already matches: the keyboard-guide
+    // tracker gets there first (it drives the interactive follow), and this
+    // is where the detent change and the layout event belong. Without it a
+    // sheet set to expand on the keyboard never expands.
     keyboardLift = lift
     if lift > 0 {
       // The keyboard opening takes the sheet to its top detent (IG comments),
@@ -1155,6 +1177,13 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
     contentUnlocked = false
     emitLayout(phase: 0)
+    // Mid-drag the finger owns the height: take the new lift into the
+    // layout and leave the sheet where it is, so blurring the keyboard on a
+    // drag does not jump it to a detent. The release settles it as usual.
+    if panInFlight, dragOwner != .content {
+      layoutSheet()
+      return
+    }
     let target = targetHeight()
     let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
     let curve = (info[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)?.uintValue ?? 7
@@ -1175,6 +1204,30 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
   }
 
+  /// How far the keyboard pushes the content: its overlap with the sheet's
+  /// bottom, less the content's own bottom inset (that padding sits over the
+  /// keyboard).
+  private func liftForKeyboard() -> CGFloat {
+    guard let top = keyboardTop, let layer = sheetLayer else { return 0 }
+    let overlap = layer.bounds.height - bottomInset - top
+    guard overlap > 1 else { return 0 }
+    return max(0, overlap - contentBottomInset)
+  }
+
+  /// The keyboard layout guide moved. Inside the keyboard's own show/hide
+  /// animation the layout rides that animation; during an interactive
+  /// dismissal (a list with `keyboardDismissMode="interactive"`) no
+  /// notification fires at all, and this is what makes the footer follow the
+  /// keyboard down with the finger.
+  fileprivate func keyboardGuideMoved(top: CGFloat) {
+    guard isPresented, keyboardMode != "none", let layer = sheetLayer else { return }
+    keyboardTop = top >= layer.bounds.height - 1 ? nil : top
+    let lift = liftForKeyboard()
+    guard abs(lift - keyboardLift) > 0.5 else { return }
+    keyboardLift = lift
+    layoutSheet()
+  }
+
   // MARK: - The layer attached to the screen host
 
   fileprivate final class GrabberView: UIView {
@@ -1189,6 +1242,8 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     }
     let dimView = UIView()
     let container = UIView()
+    /// Pinned to `keyboardLayoutGuide`; its moves report the keyboard frame by frame.
+    private let keyboardTracker = KeyboardTrackerView()
     let grabber = GrabberView()
     let handleSlot = UIView()
     let bodySlot = UIView()
@@ -1209,18 +1264,41 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
       container.layer.cornerCurve = .continuous
       container.accessibilityLabel = "Bottom Sheet"
       addSubview(container)
-      grabber.layer.cornerRadius = 2.5
-      grabber.isAccessibilityElement = true
-      grabber.accessibilityLabel = "Bottom sheet handle"
-      grabber.accessibilityHint = "Drag up or down to extend or minimize the bottom sheet"
-      grabber.accessibilityTraits = .adjustable
-      container.addSubview(grabber)
       handleSlot.clipsToBounds = true
       container.addSubview(handleSlot)
       bodySlot.clipsToBounds = true
       container.addSubview(bodySlot)
       footerSlot.clipsToBounds = true
       container.addSubview(footerSlot)
+      // After the slots: stays visible over a body that starts at 0
+      // (`grabberAreaHeight` 0 with the grabber on).
+      grabber.layer.cornerRadius = 2.5
+      grabber.isAccessibilityElement = true
+      grabber.accessibilityLabel = "Bottom sheet handle"
+      grabber.accessibilityHint = "Drag up or down to extend or minimize the bottom sheet"
+      grabber.accessibilityTraits = .adjustable
+      container.addSubview(grabber)
+
+      keyboardTracker.isUserInteractionEnabled = false
+      keyboardTracker.translatesAutoresizingMaskIntoConstraints = false
+      keyboardTracker.onMove = { [weak self] top in
+        guard let self else { return }
+        // Before iOS 17 the hidden guide rests on the safe area; read that as "no keyboard".
+        var top = top
+        if #unavailable(iOS 17.0), top >= self.bounds.height - self.safeAreaInsets.bottom - 1 {
+          top = self.bounds.height
+        }
+        self.owner?.keyboardGuideMoved(top: top)
+      }
+      insertSubview(keyboardTracker, at: 0)
+      // Hidden keyboard = the layer's bottom edge, not the safe area's.
+      if #available(iOS 17.0, *) { keyboardLayoutGuide.usesBottomSafeArea = false }
+      NSLayoutConstraint.activate([
+        keyboardTracker.leadingAnchor.constraint(equalTo: leadingAnchor),
+        keyboardTracker.widthAnchor.constraint(equalToConstant: 1),
+        keyboardTracker.topAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor),
+        keyboardTracker.heightAnchor.constraint(equalToConstant: 1),
+      ])
     }
 
     @available(*, unavailable)
@@ -1235,7 +1313,7 @@ public final class NativeBottomSheetContent: UIView, UIGestureRecognizerDelegate
     /// them through to the screen beneath otherwise.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
       let hit = super.hitTest(point, with: event)
-      if hit === self || hit === dimView {
+      if hit === self || hit === dimView || hit === keyboardTracker {
         return (owner?.blocksBackdropTouches ?? false) ? dimView : nil
       }
       // A touch is landing on React content. Whatever moved the sheet since
@@ -1274,5 +1352,27 @@ private final class SlopPanGestureRecognizer: UIPanGestureRecognizer {
   override func reset() {
     origin = nil
     super.reset()
+  }
+}
+
+/// A 1pt view riding the keyboard layout guide; reports its top on every move.
+private final class KeyboardTrackerView: UIView {
+  var onMove: ((CGFloat) -> Void)?
+  private var lastTop: CGFloat = .nan
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    report()
+  }
+
+  override var center: CGPoint {
+    didSet { report() }
+  }
+
+  private func report() {
+    let top = frame.minY
+    guard top != lastTop else { return }
+    lastTop = top
+    onMove?(top)
   }
 }
