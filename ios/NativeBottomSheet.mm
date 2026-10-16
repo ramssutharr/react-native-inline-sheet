@@ -180,6 +180,34 @@ using namespace facebook::react;
     }
     [queue addObjectsFromArray:view.subviews];
   }
+  // No React list in the body: accept a native vertical
+  // UICollectionView (e.g. the Giphy grid), so it gets the same
+  // expand-to-top-then-scroll lock. Pickers / date pickers / text views (and
+  // everything inside them) are never candidates — pinning their internal
+  // scroll views fights them every frame.
+  NSMutableArray<UIView *> *fallback = [NSMutableArray arrayWithObject:root];
+  visited = 0;
+  while (fallback.count > 0 && visited < 4000) {
+    UIView *view = fallback.firstObject;
+    [fallback removeObjectAtIndex:0];
+    visited++;
+    if ([view isKindOfClass:[UIPickerView class]] || [view isKindOfClass:[UIDatePicker class]] ||
+        [view isKindOfClass:[UITextView class]]) {
+      continue;
+    }
+    if ([view isKindOfClass:[UICollectionView class]]) {
+      UICollectionView *collection = (UICollectionView *)view;
+      UICollectionViewFlowLayout *flow =
+          [collection.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]]
+              ? (UICollectionViewFlowLayout *)collection.collectionViewLayout
+              : nil;
+      BOOL horizontal = flow != nil && flow.scrollDirection == UICollectionViewScrollDirectionHorizontal;
+      if (!horizontal) {
+        return collection;
+      }
+    }
+    [fallback addObjectsFromArray:view.subviews];
+  }
   return nil;
 }
 
